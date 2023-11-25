@@ -100,6 +100,7 @@ type Raft struct {
 	electionTimer *time.Timer     // Timer for election timeout
 	heartbeatTimer *time.Timer    // Timer for heartbeat
 	msgs          RaftMessages	  // Channel for internal messages
+	grTracker sync.WaitGroup      // WaitGroup for tracking and cleaning up goroutines
 
 	// volatile state on candidates
 	voteCount     int  		 	  // Number of votes received
@@ -113,6 +114,11 @@ func (rf *Raft) GetState() (int, bool) {
 	// var isleader bool
 	// // Your code here (2A).
 	// return term, isleader
+	rf.grTracker.Add(1)
+	defer rf.grTracker.Done()
+	if rf.killed() {
+		return TermNone, false
+	}
 	rf.msgs.getStateReq.inC <- struct{}{}
 	<- rf.msgs.getStateReq.outC
 	return rf.msgs.getStateReq.term, rf.msgs.getStateReq.isLeader
@@ -191,6 +197,11 @@ func (rf *Raft) RequestVoteRPC(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// reply false if term < currentTerm
 	// if votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote
+	rf.grTracker.Add(1)
+	defer rf.grTracker.Done()
+	if rf.killed() {
+		return
+	}
 	rf.msgs.voteReq.inC <- args
 	*reply = *<-rf.msgs.voteReq.outC
 }
@@ -254,6 +265,11 @@ func (rf* Raft) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	ok := rf.peers[server].Call("Raft.RequestVoteRPC", args, reply)
 	if ok {
+		rf.grTracker.Add(1)
+		defer rf.grTracker.Done()
+		if rf.killed() {
+			return
+		}
 		rf.msgs.voteResp.inC <- reply
 	}
 }
@@ -302,6 +318,11 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntriesRPC(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.grTracker.Add(1)
+	defer rf.grTracker.Done()
+	if rf.killed() {
+		return
+	}
 	rf.msgs.appReq.inC <- args
 	*reply = *<-rf.msgs.appReq.outC
 }
@@ -317,6 +338,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 			rf.becomeFollower()
 		}
 	}
+	if rf.state == StateCandidate {
+		rf.becomeFollower()
+	}
 	rf.leader = args.LeaderId
 	rf.resetElectionTimer(rf.randomizedElectionTimeout())
 	return &AppendEntriesReply{rf.currentTerm}
@@ -325,6 +349,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	ok := rf.peers[server].Call("Raft.AppendEntriesRPC", args, reply)
 	if ok {
+		rf.grTracker.Add(1)
+		defer rf.grTracker.Done()
+		if rf.killed() {
+			return
+		}
 		rf.msgs.appResp.inC <- reply
 	}
 }
@@ -384,6 +413,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.grTracker.Wait()
+	rf.electionTimer.Stop()
+	rf.heartbeatTimer.Stop()
 	close(rf.msgs.shutdown)
 }
 
@@ -465,7 +497,6 @@ func (rf *Raft) run() {
 				LogPrint(dTimer, "S%d Heartbeat Timeout Term: %d", rf.me, rf.currentTerm)
 				rf.sendAppendEntriesAsync(&AppendEntriesArgs{rf.currentTerm, rf.me})
 				rf.resetHeartbeatTimer(rf.stableHeartbeatTimeout())
-				LogPrint(dTimer, "S%d Heartbeat Timeout Over Term: %d", rf.me, rf.currentTerm)
 			}
 		
 		case <-rf.msgs.shutdown:
