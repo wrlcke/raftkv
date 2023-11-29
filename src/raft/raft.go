@@ -320,6 +320,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int                      // currentTerm, for leader to update itself
 	Success bool                  // true if follower contained entry matching prevLogIndex and prevLogTerm
+	RetryMatchIndex int             // possible match index for leader to retry
+	RetryMatchTerm int              // possible log term for leader to retry
 }
 
 func (rf *Raft) AppendEntriesRPC(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -341,7 +343,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 
 	if args.Term < rf.currentTerm {
-		return &AppendEntriesReply{rf.currentTerm, false}
+		return &AppendEntriesReply{rf.currentTerm, false, IndexNone, TermNone}
 	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm, rf.votedFor = args.Term, VotedForNone
@@ -357,7 +359,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	rf.resetElectionTimer(rf.randomizedElectionTimeout())
 
 	if args.PrevLogIndex > rf.lastLogIndex() || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
-		return &AppendEntriesReply{rf.currentTerm, false}
+		retryMatchIndex, retryMatchTerm := IndexNone, TermNone
+		// The `args.PrevLogIndex` is guaranteed to be a mismatch. 
+		// Therefore, we initially try `args.PrevLogIndex - 1` (or `lastLogIndex` if `args.PrevLogIndex` is too large).		
+		if args.PrevLogIndex > rf.lastLogIndex() {
+			retryMatchIndex, retryMatchTerm = rf.lastLogIndex(), rf.lastLogTerm()
+		} else {
+			retryMatchIndex, retryMatchTerm = args.PrevLogIndex - 1, rf.log[args.PrevLogIndex - 1].Term
+		}
+		// If the term of the index we're trying is greater than `args.PrevLogTerm`, 
+		// then because the tried index is less than `args.PrevLogIndex`, 
+		// the term of the leader's log at this index is definitely less than or equal to 
+		// `args.PrevLogTerm` (because terms of the logs increase monotonically). 
+		// Hence, it must be less than (and so mismatch) the term of my log at this index. 
+		if retryMatchTerm > args.PrevLogTerm {
+			// We continue to search backwards until we find an index where the term is 
+			// less than or equal to `args.PrevLogTerm`. 
+			// Only then, the term of the leader at this index could possibly be equal to
+			//  the term of my log at this index.
+			for i:=retryMatchIndex - 1; i > IndexStart; i-- {
+				if rf.log[i].Term <= args.PrevLogTerm {
+					retryMatchIndex, retryMatchTerm = i, rf.log[i].Term
+					break
+				}
+			}
+		}
+		return &AppendEntriesReply{rf.currentTerm, false, retryMatchIndex, retryMatchTerm}
 	}
 
 	for i:=0; i < len(args.Entries); i++ {
@@ -386,7 +413,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 			rf.lastApplied = rf.commitIndex
 		}
 	}
-	return &AppendEntriesReply{rf.currentTerm, true}
+	return &AppendEntriesReply{rf.currentTerm, true, IndexNone, TermNone}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -457,8 +484,23 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 			rf.lastApplied = rf.commitIndex
 		}
 	} else {
-		if rf.nextIndex[server] > args.PrevLogIndex {
-			rf.nextIndex[server] = args.PrevLogIndex
+		if rf.nextIndex[server] > reply.RetryMatchIndex {
+			retryMatchIndex, retryMatchTerm := reply.RetryMatchIndex, reply.RetryMatchTerm
+			// If the log at `retryMatchIndex` the follower returned turns out to be a mismatch,
+			// If my term of the log at `retryMatchIndex` is greater than the follower's term,
+			// then we follow the same procedure as in `AppendEntries` to find a possible match index.
+			// Otherwise, we simply decrement `retryMatchIndex`.
+			if rf.log[retryMatchIndex].Term > retryMatchTerm {
+				for i:=retryMatchIndex - 1; i > IndexStart; i-- {
+					if rf.log[i].Term <= retryMatchTerm {
+						retryMatchIndex = i
+						break
+					}
+				}
+			} else if rf.log[retryMatchIndex].Term < retryMatchTerm {
+				retryMatchIndex--
+			}
+			rf.nextIndex[server] = retryMatchIndex + 1
 			rf.sendAppendEntriesAsync(server)
 		}
 	}
