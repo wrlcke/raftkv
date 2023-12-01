@@ -14,14 +14,25 @@ import "time"
 import "math/rand"
 import "sync/atomic"
 import "sync"
+import "os"
 import "go.uber.org/goleak"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
+func getLeakCheck() bool {
+	v := os.Getenv("LEAK_CHECK")
+	return v != ""
+}
+
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m, goleak.IgnoreAnyFunction("6.5840/labrpc.(*ClientEnd).Call"))
+	if getLeakCheck() {
+		goleak.VerifyTestMain(m, goleak.IgnoreAnyFunction("6.5840/labrpc.(*ClientEnd).Call"))
+	} else {
+		ec := m.Run()
+		os.Exit(ec)
+	}
 }
 
 func TestInitialElection2A(t *testing.T) {

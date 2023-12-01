@@ -18,13 +18,13 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -143,12 +143,23 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		rf.currentTerm = TermStart
+		rf.votedFor = VotedForNone
+		rf.log = make([]LogEntry, IndexStart + 1, 10000)
+		rf.persist()
 		return
 	}
 	// Your code here (2C).
@@ -164,6 +175,11 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&rf.currentTerm) != nil || d.Decode(&rf.votedFor) != nil || d.Decode(&rf.log) != nil {
+		panic("Error reading persisted state")
+	}
 }
 
 
@@ -508,8 +524,10 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 }
 
 func (rf *Raft) sendApplyMsgs(prevIndex int, entries []LogEntry) {
-	rf.msgs.senderGroup.add()
-	defer rf.msgs.senderGroup.done()
+	// When doing synchronous apply, we can't add senderGroup here
+	// TODO(async apply): When changing to asynchronous apply, we need to add senderGroup
+	// rf.msgs.senderGroup.add()
+	// defer rf.msgs.senderGroup.done()
 
 	for i:=0; !rf.killed() && i < len(entries); i++ {
 		msg := ApplyMsg{}
@@ -580,7 +598,8 @@ func (rf *Raft) cleanup() {
 	rf.electionTimer.Stop()
 	rf.heartbeatTimer.Stop()
 	rf.msgs.senderGroup.wait()
-	close(rf.applyCh)
+	// TODO(async apply): When changing to asynchronous apply, we need to close applyCh here
+	// close(rf.applyCh)
 	close(rf.msgs.shutdown)
 }
 
@@ -708,6 +727,8 @@ func (rf *Raft) runner() {
 	for rf.running() {
 		rf.run()
 	}
+	// TODO(async apply): When changing to asynchronous apply, we won't need to close applyCh here
+	close(rf.applyCh)
 }
 
 func (rf *Raft) running() bool {
@@ -769,10 +790,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = TermStart
-	rf.votedFor = VotedForNone
-	rf.log = make([]LogEntry, IndexStart + 1, 10000)
-
 	rf.commitIndex = IndexStart
 	rf.lastApplied = IndexStart
 

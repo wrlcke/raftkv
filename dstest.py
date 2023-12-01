@@ -34,6 +34,13 @@ from rich.traceback import install
 
 install(show_locals=True)
 
+PROFILE_TYPES = {
+    "cpu": "cpuprofile",
+    "mem": "memprofile",
+    "block": "blockprofile",
+    "mutex": "mutexprofile",
+    "trace": "trace",
+}
 
 @dataclass
 class StatsMeter:
@@ -100,17 +107,25 @@ def print_results(results: Dict[str, Dict[str, StatsMeter]], timing=False):
     print(table)
 
 
-def run_test(test: str, race: bool, timing: bool):
+def run_test(test: str, race: bool, profile: bool, timing: bool, timeout: Optional[str]) -> Tuple[str, Dict[str, str], int, float]:
     test_cmd = ["go", "test", f"-run={test}"]
     if race:
         test_cmd.append("-race")
     if timing:
         test_cmd = ["time"] + test_cmd
-    f, path = tempfile.mkstemp()
+    f, path = {}, {}
+    f["out"], path["out"] = tempfile.mkstemp()
+    if profile:
+        for k, v in PROFILE_TYPES.items():
+            f[k], path[k] = tempfile.mkstemp()
+            test_cmd.append(f"-{v}={path[k]}")
+    if timeout is not None:
+        test_cmd.append(f"-timeout={timeout}")
     start = time.time()
-    proc = subprocess.run(test_cmd, stdout=f, stderr=f)
+    proc = subprocess.run(test_cmd, stdout=f["out"], stderr=f["out"])
     runtime = time.time() - start
-    os.close(f)
+    for fd in f.values():
+        os.close(fd)
     return test, path, proc.returncode, runtime
 
 
@@ -135,7 +150,10 @@ def run_tests(
     race: bool             = typer.Option(False,  '--race/--no-race',  '-r/-R', help='Run with race checker'),
     loop: bool             = typer.Option(False,  '--loop',            '-l',    help='Run continuously'),
     growth: int            = typer.Option(10,     '--growth',          '-g',    help='Growth ratio of iterations when using --loop'),
-    timing: bool           = typer.Option(False,   '--timing',          '-t',    help='Report timing, only works on macOS'),
+    timing: bool           = typer.Option(False,  '--timing',          '-t',    help='Report timing, only works on macOS'),
+    leak_check: bool       = typer.Option(False,  '--leak-check',      '-L',    help='Run with leak check'),
+    profile: bool          = typer.Option(False,  '--profile',         '-P',    help='Run with profiling and generate profiles'),
+    timeout: Optional[str] = typer.Option(None,   '--timeout',         '-T',    help='Timeout for each test'),
     # fmt: on
 ):
 
@@ -149,6 +167,13 @@ def run_tests(
     if verbose > 0:
         print(f"[yellow] Verbosity level set to {verbose}[/yellow]")
         os.environ['VERBOSE'] = str(verbose)
+
+    if leak_check:
+        print("[yellow]Running with leak check[/yellow]")
+        os.environ['LEAK_CHECK'] = '1'
+    
+    if profile:
+        print("[yellow]Running with profiling[/yellow]")
 
     while True:
 
@@ -201,7 +226,7 @@ def run_tests(
                     n = len(futures)
                     if n < workers:
                         for test in itertools.islice(test_instances, workers-n):
-                            futures.append(executor.submit(run_test, test, race, timing))
+                            futures.append(executor.submit(run_test, test, race, profile, timing, timeout))
 
                     done, not_done = wait(futures, return_when=FIRST_COMPLETED)
 
@@ -212,6 +237,10 @@ def run_tests(
                         results[test]['time'].add(runtime)
                         task_progress.update(tasks[test], advance=1)
                         dest = (output / f"{test}_{completed}.log").as_posix()
+                        dest_profiles = {}
+                        for k,v in PROFILE_TYPES.items():
+                            dest_profiles[k] = (output / f"{v}" / f"{test}_{completed}.{v}").as_posix()
+
                         if rc != 0:
                             print(f"Failed test {test} - {dest}")
                             task_progress.update(tasks[test], description=f"[red]{test}[/red]")
@@ -222,16 +251,20 @@ def run_tests(
 
                         if rc != 0 or archive:
                             output.mkdir(exist_ok=True, parents=True)
-                            shutil.copy(path, dest)
+                            shutil.copy(path["out"], dest)
+                            for k in path.keys() & PROFILE_TYPES.keys():
+                                output.joinpath(PROFILE_TYPES[k]).mkdir(exist_ok=True, parents=True)
+                                shutil.copy(path[k], dest_profiles[k])
  
                         if timing:
-                            line = last_line(path)
+                            line = last_line(path["out"])
                             real, _, user, _, system, _ = line.replace(' '*8, '').split(' ')
                             results[test]['real_time'].add(float(real))
                             results[test]['user_time'].add(float(user))
                             results[test]['system_time'].add(float(system))
 
-                        os.remove(path)
+                        for p in path.values():
+                            os.remove(p)
 
                         completed += 1
                         total_progress.update(total_task, advance=1)
