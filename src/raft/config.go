@@ -39,7 +39,7 @@ func makeSeed() int64 {
 
 type config struct {
 	mu          sync.Mutex
-	t           *testing.T
+	t           testing.TB
 	finished    int32
 	net         *labrpc.Network
 	n           int
@@ -62,7 +62,7 @@ type config struct {
 
 var ncpu_once sync.Once
 
-func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
+func make_config(t testing.TB, n int, unreliable bool, snapshot bool) *config {
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {
 			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")

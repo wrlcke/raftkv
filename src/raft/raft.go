@@ -535,6 +535,9 @@ func (rf *Raft) sendApplyMsgs(prevIndex int, entries []LogEntry) {
 		msg.Command = entries[i].Command
 		msg.CommandIndex = prevIndex + i + 1
 		rf.applyCh <- msg
+		if rf.state == StateLeader {
+			LogPrint(dLeader, "S%d Applying Command: %v Term: %d Index: %d", rf.me, msg.Command, rf.currentTerm, msg.CommandIndex)
+		}
 	}
 }
 
@@ -628,7 +631,7 @@ func (rf *Raft) countLogReplicas(index int) int {
 }
 
 func (rf *Raft) randomizedElectionTimeout() time.Duration {
-	return time.Duration(500 + (rand.Intn(300))) * time.Millisecond
+	return time.Duration(300 + (rand.Intn(200))) * time.Millisecond
 }
 
 func (rf *Raft) stableHeartbeatTimeout() time.Duration {
@@ -690,8 +693,8 @@ func (rf *Raft) run() {
 
 			var res *StartCommandResult
 			if rf.state == StateLeader {
-				LogPrint(dLeader, "S%d Starting Command: %v Term: %d", rf.me, command, rf.currentTerm)
 				rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+				LogPrint(dLeader, "S%d Starting Command: %v Term: %d Index: %d", rf.me, command, rf.currentTerm, rf.lastLogIndex())
 				rf.persist()
 				rf.broadcastAppendEntriesAsync()
 				rf.resetHeartbeatTimer(rf.stableHeartbeatTimeout())
