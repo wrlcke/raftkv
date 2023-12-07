@@ -104,6 +104,7 @@ type Raft struct {
 	heartbeatTimer *time.Timer    // Timer for heartbeat
 	msgs          RaftMessages	  // Channel for internal messages
 	applyCh chan ApplyMsg         // Channel for sending ApplyMsg to service
+	commitCh chan []LogEntry      // Channel for sending committed log entries to applier
 
 	// volatile state on candidates
 	voteCount     int  		 	  // Number of votes received
@@ -422,10 +423,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 			rf.commitIndex = rf.lastLogIndex()
 		}
 		if rf.commitIndex > rf.lastApplied {
-			// entries := make([]LogEntry, rf.commitIndex - rf.lastApplied)
-			// copy(entries, rf.log[rf.lastApplied + 1:rf.commitIndex + 1])
-			entries := rf.log[rf.lastApplied + 1:rf.commitIndex + 1]
-			rf.sendApplyMsgs(rf.lastApplied, entries)
+			entries := rf.copyLogEntries(rf.log[rf.lastApplied + 1:rf.commitIndex + 1])
+			rf.commitCh <- entries
 			rf.lastApplied = rf.commitIndex
 		}
 	}
@@ -493,10 +492,8 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 			}
 		}
 		if rf.commitIndex > rf.lastApplied {
-			// entries := make([]LogEntry, rf.commitIndex - rf.lastApplied)
-			// copy(entries, rf.log[rf.lastApplied + 1:rf.commitIndex + 1])
-			entries := rf.log[rf.lastApplied + 1:rf.commitIndex + 1]
-			rf.sendApplyMsgs(rf.lastApplied, entries)
+			entries := rf.copyLogEntries(rf.log[rf.lastApplied + 1:rf.commitIndex + 1])
+			rf.commitCh <- entries
 			rf.lastApplied = rf.commitIndex
 		}
 	} else {
@@ -521,24 +518,6 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 		}
 	}
 
-}
-
-func (rf *Raft) sendApplyMsgs(prevIndex int, entries []LogEntry) {
-	// When doing synchronous apply, we can't add senderGroup here
-	// TODO(async apply): When changing to asynchronous apply, we need to add senderGroup
-	// rf.msgs.senderGroup.add()
-	// defer rf.msgs.senderGroup.done()
-
-	for i:=0; !rf.killed() && i < len(entries); i++ {
-		msg := ApplyMsg{}
-		msg.CommandValid = true
-		msg.Command = entries[i].Command
-		msg.CommandIndex = prevIndex + i + 1
-		rf.applyCh <- msg
-		if rf.state == StateLeader {
-			LogPrint(dLeader, "S%d Applying Command: %v Term: %d Index: %d", rf.me, msg.Command, rf.currentTerm, msg.CommandIndex)
-		}
-	}
 }
 
 func (rf *Raft) copyLogEntries(src []LogEntry) []LogEntry {
@@ -601,9 +580,15 @@ func (rf *Raft) cleanup() {
 	rf.electionTimer.Stop()
 	rf.heartbeatTimer.Stop()
 	rf.msgs.senderGroup.wait()
-	// TODO(async apply): When changing to asynchronous apply, we need to close applyCh here
-	// close(rf.applyCh)
 	close(rf.msgs.shutdown)
+}
+
+func (rf *Raft) runnerCleanup() {
+	close(rf.commitCh)
+}
+
+func (rf *Raft) applierCleanup() {
+	close(rf.applyCh)
 }
 
 func (rf *Raft) lastLogIndex() int {
@@ -730,8 +715,7 @@ func (rf *Raft) runner() {
 	for rf.running() {
 		rf.run()
 	}
-	// TODO(async apply): When changing to asynchronous apply, we won't need to close applyCh here
-	close(rf.applyCh)
+	rf.runnerCleanup()
 }
 
 func (rf *Raft) running() bool {
@@ -741,6 +725,22 @@ func (rf *Raft) running() bool {
 		default:
 			return true
 	}
+}
+
+func (rf *Raft) applier() {
+	index := IndexStart
+	for entries := range rf.commitCh {
+		for i := range entries {
+			index++
+			msg := ApplyMsg{}
+			msg.CommandValid = true
+			msg.Command = entries[i].Command
+			msg.CommandIndex = index
+			rf.applyCh <- msg
+			LogPrint(dCommit, "S%d Applying Command: %v Term: %d Index: %d", rf.me, msg.Command, entries[i].Term, msg.CommandIndex)
+		}
+	}
+	rf.applierCleanup()
 }
 
 func (rf *Raft) becomeFollower() {
@@ -803,6 +803,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.msgs.electionT.inC = rf.electionTimer.C
 	rf.msgs.heartbeatT.inC = rf.heartbeatTimer.C
 	rf.applyCh = applyCh
+	rf.commitCh = make(chan []LogEntry, 1000)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -810,6 +811,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// go rf.ticker()
 	rf.becomeFollower()
 	go rf.runner()
+	go rf.applier()
 
 	return rf
 }
