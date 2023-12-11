@@ -5,93 +5,113 @@ import (
 	"time"
 )
 
+type StorageOperation int
+const (
+	StorageNoop = iota
+	StorageAppend
+	StorageAmend
+	StorageTrim
+	StorageTrimAndAmend
+)
+var StorageOperationNames = [...]string{"StorageNoop", "StorageAppend", "StorageAmend", "StorageTrim", "StorageTrimAndAmend"}
 
-type GetStateResult struct {
+type GetStateReply struct {
 	term int
 	isLeader bool
 }
 
-type StartCommandResult struct {
+type StartCommandReply struct {
 	index int
 	term int
 	isLeader bool
 }
 
-// RequestVoteResult is used to pass the args and reply of RequestVote RPC from async caller to runner
-type RequestVoteResult struct {
-	server int
-	args *RequestVoteArgs
-	reply *RequestVoteReply
+type AppendRequest struct {
+	args *AppendEntriesArgs
+	reply *AppendEntriesReply
+	done chan struct{}
 }
 
-// AppendEntriesResult is used to pass the args and reply of AppendEntries RPC from async caller to runner
-type AppendEntriesResult struct {
+type AppendResponse struct {
 	server int
 	args *AppendEntriesArgs
 	reply *AppendEntriesReply
 }
 
-type RaftInternalMessageAppendEntriesRequest struct {
-	inC chan *AppendEntriesArgs
-	outC chan *AppendEntriesReply
+type VoteRequest struct {
+	args *RequestVoteArgs
+	reply *RequestVoteReply
+	done chan struct{}
 }
 
-type RaftInternalMessageAppendEntriesResponse struct {
-	inC chan *AppendEntriesResult
+type VoteResponse struct {
+	server int
+	args *RequestVoteArgs
+	reply *RequestVoteReply
 }
 
-type RaftInternalMessageRequestVoteRequest struct {
-	inC chan *RequestVoteArgs
-	outC chan *RequestVoteReply
+type GetStateRequest struct {
+	reply *GetStateReply
+	done chan struct{}
 }
 
-type RaftInternalMessageRequestVoteResponse struct {
-	inC chan *RequestVoteResult
+type StartCommandRequest struct {
+	args interface{}
+	reply *StartCommandReply
+	done chan struct{}
 }
 
-type RaftInternalMessageGetStateRequest struct {
-	inC chan struct{}
-	outC chan *GetStateResult
+type ApplyRequest []LogEntry
+
+type StorageRequest struct {
+	operation StorageOperation
+	prefix int 
+	suffix int
+	entries []LogEntry
+	origAppReq AppendRequest // After the storage operation is completed, the LeaderCommit and done channel is needed to update commitIndex and to respond to the AppendEntries RPC
 }
 
-type RaftInternalMessageStartCommandRequest struct {
-	inC chan interface{}
-	outC chan *StartCommandResult
-}
-
-type RaftInternalMessageElectionTimer struct {
-	inC <-chan time.Time
-}
-
-type RaftInternalMessageHeartbeatTimer struct {
-	inC <-chan time.Time
+type StorageResponse struct {
+	firstLogIndex int
+	lastLogIndex int
+	lastLogTerm int
+	origAppReqs []AppendRequest // All AppendRequests that can be responded to after the storage operation is completed
 }
 
 type RaftMessages struct {
-	appReq RaftInternalMessageAppendEntriesRequest
-	appResp RaftInternalMessageAppendEntriesResponse
-	voteReq RaftInternalMessageRequestVoteRequest
-	voteResp RaftInternalMessageRequestVoteResponse
-	getStateReq RaftInternalMessageGetStateRequest
-	startCmdReq RaftInternalMessageStartCommandRequest
-	electionT RaftInternalMessageElectionTimer
-	heartbeatT RaftInternalMessageHeartbeatTimer
-	senderGroup RaftMessageSenderWaitGroup
+	// Messages handled by Raft.runner
+	appReq chan AppendRequest
+	appResp chan AppendResponse
+	voteReq chan VoteRequest
+	voteResp chan VoteResponse
+	getStateReq chan GetStateRequest
+	startCmdReq chan StartCommandRequest
+	electionT <-chan time.Time
+	heartbeatT <-chan time.Time
+	storageResp chan StorageResponse
+	// Messages handled by Raft.applier
+	applyReq chan ApplyRequest
+	// Messages handled by Raft.persister
+	storageReq chan StorageRequest
+	// External goroutines that call raft's service methods (rpc service or exposed API) and send messages to Raft.runner
+	externalRoutines RaftMessageWaitGroup
+	// Shutdown signal for runner (Kill() waits for all previous external goroutines, and then use this signal to shutdown runner)
 	shutdown chan struct{}
 }
 
 func MakeRaftMessages() RaftMessages {
-	appReq := RaftInternalMessageAppendEntriesRequest{ make(chan *AppendEntriesArgs), make(chan *AppendEntriesReply) }
-	appResp := RaftInternalMessageAppendEntriesResponse{ make(chan *AppendEntriesResult) }
-	voteReq := RaftInternalMessageRequestVoteRequest{ make(chan *RequestVoteArgs), make(chan *RequestVoteReply) }
-	voteResp := RaftInternalMessageRequestVoteResponse{ make(chan *RequestVoteResult) }
-	getStateReq := RaftInternalMessageGetStateRequest{ make(chan struct{}), make(chan *GetStateResult) }
-	startCmdReq := RaftInternalMessageStartCommandRequest{ make(chan interface{}), make(chan *StartCommandResult) }
-	electionT := RaftInternalMessageElectionTimer{ make(chan time.Time) }
-	heartbeatT := RaftInternalMessageHeartbeatTimer{ make(chan time.Time) }
-	senderGroup := RaftMessageSenderWaitGroup{&sync.RWMutex{}}
+	appReq := make(chan AppendRequest)
+	appResp := make(chan AppendResponse)
+	voteReq := make(chan VoteRequest)
+	voteResp := make(chan VoteResponse)
+	getStateReq := make(chan GetStateRequest)
+	startCmdReq := make(chan StartCommandRequest)
+	storageResp := make(chan StorageResponse, 1000)
+	applyReq := make(chan ApplyRequest, 1000)
+	storageReq := make(chan StorageRequest, 1000)
+	externalRoutines := RaftMessageWaitGroup{&sync.RWMutex{}}
 	shutdown := make(chan struct{}) 
-	return RaftMessages{ appReq, appResp, voteReq, voteResp, getStateReq, startCmdReq, electionT, heartbeatT, senderGroup, shutdown }
+	return RaftMessages{ appReq, appResp, voteReq, voteResp, getStateReq, startCmdReq, nil, nil, storageResp, applyReq, storageReq, externalRoutines, shutdown }
 }
 
 // This waitgroup is designed to wait for all message sender goroutines 
@@ -121,19 +141,23 @@ func MakeRaftMessages() RaftMessages {
 // Instead, a read-write lock is more suitable for this requirement. 
 // However, it's important to note that the requirement itself is not to protect shared memory, 
 // but rather to block until previous readers have completed.
-type RaftMessageSenderWaitGroup struct {
+type RaftMessageWaitGroup struct {
 	rw *sync.RWMutex
 }
 
-func (wg *RaftMessageSenderWaitGroup) add() {
+func (wg *RaftMessageWaitGroup) add() {
 	wg.rw.RLock()
 }
 
-func (wg *RaftMessageSenderWaitGroup) done() {
+func (wg *RaftMessageWaitGroup) done() {
 	wg.rw.RUnlock()
 }
 
-func (wg *RaftMessageSenderWaitGroup) wait() {
+func (wg *RaftMessageWaitGroup) wait() {
 	wg.rw.Lock()
 	defer wg.rw.Unlock()
+}
+
+func (o StorageOperation) String() string {
+	return StorageOperationNames[o]
 }
