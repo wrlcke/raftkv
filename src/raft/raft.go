@@ -627,16 +627,29 @@ func (rf *Raft) run() {
 		case req := <-rf.msgs.startCmdReq:
 
 			if rf.state == StateLeader {
-				rf.store.AppendLogs(LogEntry{rf.store.CurrentTerm(), req.args})
+				batchReq := []StartCommandRequest{req}
+			batching_loop:
+				for {
+					select {
+						case req := <-rf.msgs.startCmdReq:
+							batchReq = append(batchReq, req)
+						default:
+							break batching_loop
+					}
+				}
+				for i := range batchReq {
+					rf.store.AppendLogs(LogEntry{rf.store.CurrentTerm(), batchReq[i].args})
+					LogPrint(dLeader, "S%d Starting Command: %v Term: %d Index: %d", rf.me, batchReq[i].args, rf.store.CurrentTerm(), rf.store.LastLogIndex())
+					*batchReq[i].reply = StartCommandReply{rf.store.LastLogIndex(), rf.store.CurrentTerm(), true}
+					close(batchReq[i].done)
+				}
 				rf.msgs.storageReq <- StorageRequest{}
-				LogPrint(dLeader, "S%d Starting Command: %v Term: %d Index: %d", rf.me, req.args, rf.store.CurrentTerm(), rf.store.LastLogIndex())
 				rf.broadcastAppendEntriesAsync()
 				rf.resetHeartbeatTimer(rf.stableHeartbeatTimeout())
-				*req.reply = StartCommandReply{rf.store.LastLogIndex(), rf.store.CurrentTerm(), true}
 			} else {
 				*req.reply = StartCommandReply{IndexNone, rf.store.CurrentTerm(), false}
+				close(req.done)
 			}
-			close(req.done)
 		
 		case <-rf.msgs.electionT:
 			
