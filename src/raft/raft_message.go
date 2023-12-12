@@ -5,16 +5,6 @@ import (
 	"time"
 )
 
-type StorageOperation int
-const (
-	StorageNoop = iota
-	StorageAppend
-	StorageAmend
-	StorageTrim
-	StorageTrimAndAmend
-)
-var StorageOperationNames = [...]string{"StorageNoop", "StorageAppend", "StorageAmend", "StorageTrim", "StorageTrimAndAmend"}
-
 type GetStateReply struct {
 	term int
 	isLeader bool
@@ -63,19 +53,11 @@ type StartCommandRequest struct {
 
 type ApplyRequest []LogEntry
 
-type StorageRequest struct {
-	operation StorageOperation
-	prefix int 
-	suffix int
-	entries []LogEntry
-	origAppReq AppendRequest // After the storage operation is completed, the LeaderCommit and done channel is needed to update commitIndex and to respond to the AppendEntries RPC
-}
+type StorageRequest struct {}
 
 type StorageResponse struct {
 	firstLogIndex int
 	lastLogIndex int
-	lastLogTerm int
-	origAppReqs []AppendRequest // All AppendRequests that can be responded to after the storage operation is completed
 }
 
 type RaftMessages struct {
@@ -156,8 +138,4 @@ func (wg *RaftMessageWaitGroup) done() {
 func (wg *RaftMessageWaitGroup) wait() {
 	wg.rw.Lock()
 	defer wg.rw.Unlock()
-}
-
-func (o StorageOperation) String() string {
-	return StorageOperationNames[o]
 }

@@ -7,11 +7,9 @@ import (
 	"6.5840/labgob"
 )
 
-// RaftStore is a not thread safe interface
-// But Meta and Logs are considered seperate, so you can access two parts concurrently
-// Cache and Storage are also considered seperate
-// You can access meta and cache logs in one goroutine and storage logs in another goroutine without a lock
-// but don't access meta in two goroutines or access storage logs in two goroutines unless you use a lock
+// All methods except FlushLogs() are manipulating in-memory data and should be called in the same goroutine or protected by a lock
+// FlushLogs() will persist all new logs since last call of FlushLogs, and allow calling in a different goroutine than the other functions are called (asynchronous persist)
+// But FlushLogs() itself is not thread safe, so it should be called in the same goroutine 
 type RaftStore interface {
 	CurrentTerm() int
 	VotedFor() int
@@ -19,20 +17,16 @@ type RaftStore interface {
 	SetVotedFor(votedFor int)
 	SetCurrentTermAndVotedFor(term int, votedFor int)
 
-	FirstLogIndex() int                        // First log index in log array
+	FirstLogIndex() int                       // First log index in log array
 	LastLogIndex() int                        // Last log index in log array
 	LastLogTerm() int                         // Last log term in log array
 	Log(index int) *LogEntry                  // Get log at index
-	Logs(start int, end int) []LogEntry       // Get logs from start (inclusive) to end (exclusive) 
+	Logs(start int, end int) []LogEntry       // Get a copy of logs from start (inclusive) to end (exclusive) 
 	AppendLogs(logs ...LogEntry)              // Append logs to log array
-	AmendLogs(suffix int, logs ...LogEntry)   // Remove logs after suffix (inclusive) and append logs from suffix (inclusive)
-	TrimLogs(prefix int)                      // Remove logs before prefix (exlusive)
-	TrimAndAmendLogs(prefix int, suffix int, logs ...LogEntry) 
-	                                          // Remove logs before prefix (exlusive) and after suffix (inclusive) and append logs from suffix (inclusive)
-	CopyLogEntries(start int, end int) []LogEntry
+	RemoveLogPrefix(end int)                  // Remove logs before end (exlusive)
+	RemoveLogSuffix(start int)                // Remove logs after start (inclusive)
 
-	Cache() RaftStore                       // Offered to manipulate in memory cache of raft state
-	Storage() RaftStore                     // Offered to manipulate persistent storage of raft state
+	FlushLogs()  (int, int)                   // Flush logs to storage
 }
 
 type MemoryRaftStore struct {
@@ -80,103 +74,117 @@ func (ms *MemoryRaftStore) Log(index int) *LogEntry {
 }
 
 func (ms *MemoryRaftStore) Logs(start int, end int) []LogEntry {
-	return ms.log[start - ms.firstLogIndex : end - ms.firstLogIndex]
+	dst := make([]LogEntry, end - start)
+	copy(dst, ms.log[start - ms.firstLogIndex : end - ms.firstLogIndex])
+	return dst
 }
 
 func (ms *MemoryRaftStore) AppendLogs(logs ...LogEntry) {
 	ms.log = append(ms.log, logs...)
 }
 
-func (ms *MemoryRaftStore) TrimLogs(prefix int) {
-	ms.log = ms.log[prefix - ms.firstLogIndex :]
-	ms.firstLogIndex = prefix
+func (ms *MemoryRaftStore) RemoveLogPrefix(end int) {
+	copy(ms.log, ms.log[end - ms.firstLogIndex:])
+	ms.log = ms.log[:len(ms.log) - end + ms.firstLogIndex]
+	ms.firstLogIndex = end
 }
 
-func (ms *MemoryRaftStore) AmendLogs(suffix int, logs ...LogEntry) {
-	ms.log = append(ms.log[:suffix - ms.firstLogIndex], logs...)
-}
-
-func (ms *MemoryRaftStore) TrimAndAmendLogs(prefix int, suffix int, logs ...LogEntry) {
-	ms.log = append(ms.log[prefix - ms.firstLogIndex : suffix - ms.firstLogIndex], logs...)
-	ms.firstLogIndex = prefix
-}
-
-func (ms *MemoryRaftStore) CopyLogEntries(start int, end int) []LogEntry {
-	dst := make([]LogEntry, end - start)
-	copy(dst, ms.Logs(start, end))
-	return dst
-}
-
-func (ms *MemoryRaftStore) Cache() RaftStore {
-	return ms
-}
-
-func (ms *MemoryRaftStore) Storage() RaftStore {
-	return ms
+func (ms *MemoryRaftStore) RemoveLogSuffix(start int) {
+	ms.log = ms.log[:start - ms.firstLogIndex]
 }
 
 type LabPersister struct {
 	MemoryRaftStore
+	buffer LabPersisterBuffer
 	storage LabPersisterStorage
-}
-
-type LabPersisterStorage struct {
-	MemoryRaftStore
-	rw sync.RWMutex              // because the persister provided by the lab mixes all states together and must be persisted together, use read write lock to protect currentTerm or votedFor when performing async log write
-	persister *Persister
 }
 
 func MakeLabPersister(persister *Persister) *LabPersister {
 	lp := &LabPersister{storage: LabPersisterStorage{persister: persister}}
 	lp.storage.readPersist(persister.ReadRaftState())
-	cachelog := make([]LogEntry, len(lp.storage.log))
-	copy(cachelog, lp.storage.log)
+	memlog := make([]LogEntry, len(lp.storage.log), cap(lp.storage.log))
+	copy(memlog, lp.storage.log)
 	lp.currentTerm, lp.votedFor, lp.firstLogIndex, lp.log =
-		lp.storage.currentTerm, lp.storage.votedFor, lp.storage.firstLogIndex, cachelog
+		lp.storage.currentTerm, lp.storage.votedFor, lp.storage.firstLogIndex, memlog
+	lp.buffer.appendLogs = make([]LogEntry, 0, 2000)
+	lp.buffer.appendStartIndex = lp.LastLogIndex() + 1
 	return lp
-}
-
-func (lp *LabPersister) Cache() RaftStore {
-	return &lp.MemoryRaftStore
-}
-
-func (lp *LabPersister) Storage() RaftStore {
-	return &lp.storage
 }
 
 func (lp *LabPersister) SetCurrentTerm(term int) {
 	lp.MemoryRaftStore.SetCurrentTerm(term)
+	lp.storage.rw.Lock()            
 	lp.storage.SetCurrentTerm(term)
+	lp.storage.rw.Unlock()
+	lp.storage.persist()
 }
 
 func (lp *LabPersister) SetVotedFor(votedFor int) {
 	lp.MemoryRaftStore.SetVotedFor(votedFor)
+	lp.storage.rw.Lock()
 	lp.storage.SetVotedFor(votedFor)
+	lp.storage.rw.Unlock()
+	lp.storage.persist()
 }
 
 func (lp *LabPersister) SetCurrentTermAndVotedFor(term int, votedFor int) {
 	lp.MemoryRaftStore.SetCurrentTermAndVotedFor(term, votedFor)
+	lp.storage.rw.Lock()
 	lp.storage.SetCurrentTermAndVotedFor(term, votedFor)
+	lp.storage.rw.Unlock()
+	lp.storage.persist()
 }
 
 func (lp *LabPersister) AppendLogs(logs ...LogEntry) {
 	lp.MemoryRaftStore.AppendLogs(logs...)
-	lp.storage.AppendLogs(logs...)
+	lp.buffer.rw.Lock()
+	lp.buffer.appendLogs = append(lp.buffer.appendLogs, logs...)
+	lp.buffer.clear = false
+	lp.buffer.rw.Unlock()
 }
 
-func (lp *LabPersister) AmendLogs(suffix int, logs ...LogEntry) {
-	lp.MemoryRaftStore.AmendLogs(suffix, logs...)
-	lp.storage.AmendLogs(suffix, logs...)
+func (lp *LabPersister) RemoveLogPrefix(end int) {
+	lp.MemoryRaftStore.RemoveLogPrefix(end)
+	lp.buffer.rw.Lock()
+	// TODO in Snapshot
+	lp.buffer.clear = false
+	lp.buffer.rw.Unlock()
 }
 
-func (lp *LabPersister) TrimLogs(prefix int) {
-	lp.MemoryRaftStore.TrimLogs(prefix)
-	lp.storage.TrimLogs(prefix)
+func (lp *LabPersister) RemoveLogSuffix(start int) {
+	lp.MemoryRaftStore.RemoveLogSuffix(start)
+	lp.buffer.rw.Lock()
+	if start <= lp.buffer.appendStartIndex {
+		lp.buffer.appendLogs = lp.buffer.appendLogs[:0]
+		lp.buffer.appendStartIndex = start
+	} else {
+		lp.buffer.appendLogs = lp.buffer.appendLogs[:start - lp.buffer.appendStartIndex]
+	}
+	lp.buffer.clear = false
+	lp.buffer.rw.Unlock()
 }
 
-func (lp *LabPersister) TrimAndAmendLogs(prefix int, suffix int, logs ...LogEntry) {
-	lp.MemoryRaftStore.TrimAndAmendLogs(prefix, suffix, logs...)
-	lp.storage.TrimAndAmendLogs(prefix, suffix, logs...)
+func (lp *LabPersister) FlushLogs() (int, int) {
+	lp.buffer.rw.Lock()
+	if lp.buffer.clear {
+		lp.buffer.rw.Unlock()
+		return lp.storage.FirstLogIndex(), lp.storage.LastLogIndex()
+	}
+	lp.storage.rw.Lock()
+	lp.storage.log = append(lp.storage.log[:lp.buffer.appendStartIndex - lp.storage.firstLogIndex], lp.buffer.appendLogs...)
+	lp.storage.rw.Unlock()
+	lp.buffer.appendLogs = lp.buffer.appendLogs[:0]
+	lp.buffer.appendStartIndex = lp.storage.LastLogIndex() + 1
+	lp.buffer.clear = true
+	lp.buffer.rw.Unlock()
+	lp.storage.persist()
+	return lp.storage.FirstLogIndex(), lp.storage.LastLogIndex()
+}
+
+type LabPersisterStorage struct {
+	MemoryRaftStore
+	rw sync.RWMutex            	  // because the persister provided by the lab mixes all states together and must be persisted together, use a read-write lock to protect the log and the other state
+	persister *Persister
 }
 
 // save Raft's persistent state to stable storage,
@@ -198,17 +206,14 @@ func (lps *LabPersisterStorage) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	lps.rw.RLock()
-	t, v, f, l := lps.currentTerm, lps.votedFor, lps.firstLogIndex, make([]LogEntry, len(lps.log))
-	copy(l, lps.log)
-	lps.rw.RUnlock()
-	e.Encode(t)
-	e.Encode(v)
-	e.Encode(f)
-	e.Encode(l)
+	defer lps.rw.RUnlock()
+	e.Encode(lps.currentTerm)
+	e.Encode(lps.votedFor)
+	e.Encode(lps.firstLogIndex)
+	e.Encode(lps.log)
 	raftstate := w.Bytes()
 	lps.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (lps *LabPersisterStorage) readPersist(data []byte) {
@@ -240,113 +245,14 @@ func (lps *LabPersisterStorage) readPersist(data []byte) {
 	if d.Decode(&lps.currentTerm) != nil || d.Decode(&lps.votedFor) != nil || d.Decode(&lps.firstLogIndex) != nil || d.Decode(&lps.log) != nil {
 		panic("Error reading persisted state")
 	}
+	// Expand capacity to reduce memory allocation for subsequent append operations
+	lps.log = append(make([]LogEntry, 0, 10000), lps.log...) 
 }
 
-func (lps *LabPersisterStorage) CurrentTerm() int {
-	lps.rw.RLock()
-	defer lps.rw.RUnlock()
-	return lps.currentTerm
-}
-
-func (lps *LabPersisterStorage) VotedFor() int {
-	lps.rw.RLock()
-	defer lps.rw.RUnlock()
-	return lps.votedFor
-}
-
-func (lps *LabPersisterStorage) SetCurrentTerm(term int) {
-	lps.rw.Lock()
-	lps.currentTerm = term
-	lps.rw.Unlock()
-	lps.persist()
-}
-
-func (lps *LabPersisterStorage) SetVotedFor(votedFor int) {
-	lps.rw.Lock()
-	lps.votedFor = votedFor
-	lps.rw.Unlock()
-	lps.persist()
-}
-
-func (lps *LabPersisterStorage) SetCurrentTermAndVotedFor(term int, votedFor int) {
-	lps.rw.Lock()
-	lps.currentTerm, lps.votedFor = term, votedFor
-	lps.rw.Unlock()
-	lps.persist()
-}
-
-func (lps *LabPersisterStorage) FirstLogIndex() int {
-	lps.rw.RLock()
-	defer lps.rw.RUnlock()
-	return lps.firstLogIndex
-}
-
-func (lps *LabPersisterStorage) LastLogIndex() int {
-	lps.rw.RLock()
-	defer lps.rw.RUnlock()
-	return len(lps.log) - 1 + lps.firstLogIndex
-}
-
-func (lps *LabPersisterStorage) LastLogTerm() int {
-	lps.rw.RLock()
-	defer lps.rw.RUnlock()
-	return lps.log[len(lps.log) - 1].Term
-}
-
-func (lps *LabPersisterStorage) Log(index int) *LogEntry {
-	lps.rw.RLock()
-	defer lps.rw.RUnlock()
-	return &lps.log[index - lps.firstLogIndex]
-}
-
-func (lps *LabPersisterStorage) Logs(start int, end int) []LogEntry {
-	lps.rw.RLock()
-	defer lps.rw.RUnlock()
-	return lps.log[start - lps.firstLogIndex : end - lps.firstLogIndex]
-}
-
-func (lps *LabPersisterStorage) AppendLogs(logs ...LogEntry) {
-	lps.rw.Lock()
-	lps.log = append(lps.log, logs...)
-	lps.rw.Unlock()
-	lps.persist()
-}
-
-func (lps *LabPersisterStorage) TrimLogs(prefix int) {
-	lps.rw.Lock()
-	lps.log = lps.log[prefix - lps.firstLogIndex :]
-	lps.firstLogIndex = prefix
-	lps.rw.Unlock()
-	lps.persist()
-}
-
-func (lps *LabPersisterStorage) AmendLogs(suffix int, logs ...LogEntry) {
-	lps.rw.Lock()
-	lps.log = append(lps.log[:suffix - lps.firstLogIndex], logs...)
-	lps.rw.Unlock()
-	lps.persist()
-}
-
-func (lps *LabPersisterStorage) TrimAndAmendLogs(prefix int, suffix int, logs ...LogEntry) {
-	lps.rw.Lock()
-	lps.log = append(lps.log[prefix - lps.firstLogIndex : suffix - lps.firstLogIndex], logs...)
-	lps.firstLogIndex = prefix
-	lps.rw.Unlock()
-	lps.persist()
-}
-
-func (lps *LabPersisterStorage) CopyLogEntries(start int, end int) []LogEntry {
-	dst := make([]LogEntry, end - start)
-	lps.rw.RLock()
-	copy(dst, lps.Logs(start, end))
-	lps.rw.RUnlock()
-	return dst
-}
-
-func (lps *LabPersisterStorage) Cache() RaftStore {
-	return lps
-}
-
-func (lps *LabPersisterStorage) Storage() RaftStore {
-	return lps
+// The buffer track the unpersisted logs in memory 
+type LabPersisterBuffer struct {
+	appendStartIndex int
+	appendLogs []LogEntry
+	clear bool
+	rw sync.RWMutex
 }

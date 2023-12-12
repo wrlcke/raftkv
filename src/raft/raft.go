@@ -105,6 +105,7 @@ type Raft struct {
 	heartbeatTimer *time.Timer    // Timer for heartbeat
 	msgs          RaftMessages	  // Channel for internal messages
 	applyCh chan ApplyMsg         // Channel for sending ApplyMsg to service
+	steppedDown   atomic.Bool	  // Flag for whether the leader has stepped down, to shutdown the persister
 
 	// volatile state on candidates
 	voteCount     int  		 	  // Number of votes received
@@ -347,27 +348,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 		}
 		return &AppendEntriesReply{rf.store.CurrentTerm(), false, retryMatchIndex, retryMatchTerm}
 	}
-	successMatchIndex := args.PrevLogIndex + len(args.Entries)  // successMatchIndex is only used for follower later to generate storage request from append request, not for sending back to leader (just don't want to break this method's signature which will make it ugly)
 	for i:=0; i < len(args.Entries); i++ {
 		if rf.store.LastLogIndex() < args.PrevLogIndex + 1 + i {
-			successMatchIndex = rf.store.LastLogIndex()
-			rf.store.Cache().AppendLogs(args.Entries[i:]...)
+			rf.store.AppendLogs(args.Entries[i:]...)
+			rf.store.FlushLogs()
 			break
 		}
 		if rf.store.Log(args.PrevLogIndex + 1 + i).Term != args.Entries[i].Term {
-			successMatchIndex = args.PrevLogIndex + i
-			rf.store.Cache().AmendLogs(args.PrevLogIndex + 1 + i, args.Entries[i:]...)
+			rf.store.RemoveLogSuffix(args.PrevLogIndex + 1 + i)
+			rf.store.AppendLogs(args.Entries[i:]...)
+			rf.store.FlushLogs()
 			break
 		}
 	}
-	// Committed entries will never be overwritten, so even we do storage asynchronously, we update commitIndex here
+	// Committed entries will never be overwritten, so even we do storage asynchronously, we can update commitIndex here
 	rf.commitIndex = Max(rf.commitIndex, Min(args.LeaderCommit, rf.store.LastLogIndex()))
 	if rf.commitIndex > rf.lastApplied {
-		entries := rf.store.CopyLogEntries(rf.lastApplied + 1, rf.commitIndex + 1)
+		entries := rf.store.Logs(rf.lastApplied + 1, rf.commitIndex + 1)
 		rf.msgs.applyReq <- entries
 		rf.lastApplied = rf.commitIndex
 	}
-	return &AppendEntriesReply{rf.store.CurrentTerm(), true, successMatchIndex, TermNone}
+	return &AppendEntriesReply{rf.store.CurrentTerm(), true, IndexNone, TermNone}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -388,7 +389,7 @@ func (rf *Raft) sendAppendEntriesAsync(server int) {
 	args.LeaderId = rf.me
 	args.PrevLogIndex = rf.nextIndex[server] - 1
 	args.PrevLogTerm = rf.store.Log(args.PrevLogIndex).Term
-	args.Entries = rf.store.CopyLogEntries(rf.nextIndex[server], rf.store.LastLogIndex() + 1)
+	args.Entries = rf.store.Logs(rf.nextIndex[server], rf.store.LastLogIndex() + 1)
 	args.LeaderCommit = rf.commitIndex
 	go rf.sendAppendEntries(server, args, &AppendEntriesReply{})
 }
@@ -430,12 +431,12 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 			}
 		}
 		if rf.commitIndex > rf.lastApplied {
-			entries := rf.store.CopyLogEntries(rf.lastApplied + 1, rf.commitIndex + 1)
+			entries := rf.store.Logs(rf.lastApplied + 1, rf.commitIndex + 1)
 			rf.msgs.applyReq <- entries
 			rf.lastApplied = rf.commitIndex
 		}
 	} else {
-		if rf.nextIndex[server] > reply.RetryMatchIndex {
+		if rf.matchIndex[server] < args.PrevLogIndex && rf.nextIndex[server] > reply.RetryMatchIndex {
 			retryMatchIndex, retryMatchTerm := reply.RetryMatchIndex, reply.RetryMatchTerm
 			// If the log at `retryMatchIndex` the follower returned turns out to be a mismatch,
 			// If my term of the log at `retryMatchIndex` is greater than the follower's term,
@@ -455,7 +456,23 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 			rf.sendAppendEntriesAsync(server)
 		}
 	}
+}
 
+func (rf *Raft) storageReturn(firstLogIndex int, lastLogIndex int) {
+	if rf.state == StateLeader && rf.matchIndex[rf.me] < lastLogIndex {
+		rf.matchIndex[rf.me] = lastLogIndex
+		for i := lastLogIndex; i > rf.commitIndex; i-- {
+			if rf.store.Log(i).Term == rf.store.CurrentTerm() && rf.countLogReplicas(i) > len(rf.peers)/2 {
+				rf.commitIndex = i
+				break
+			}
+		}
+		if rf.commitIndex > rf.lastApplied {
+			entries := rf.store.Logs(rf.lastApplied + 1, rf.commitIndex + 1)
+			rf.msgs.applyReq <- entries
+			rf.lastApplied = rf.commitIndex
+		}
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -487,31 +504,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	<-done
 	return reply.index, reply.term, reply.isLeader
 	// return index, term, isLeader
-}
-
-func (rf *Raft) storageReturn(firstLogIndex int, lastLogIndex int, lastLogTerm int, origAppReqs []AppendRequest) {
-	for i := range origAppReqs {
-		if origAppReqs[i].done != nil {
-			close(origAppReqs[i].done)
-		}
-	}
-	if rf.store.LastLogIndex() < lastLogIndex || rf.store.Log(lastLogIndex).Term != lastLogTerm {
-		return 
-	}
-	rf.matchIndex[rf.me] = lastLogIndex
-	if rf.state == StateLeader {
-		for i := lastLogIndex; i > rf.commitIndex; i-- {
-			if rf.store.Log(i).Term == rf.store.CurrentTerm() && rf.countLogReplicas(i) > len(rf.peers)/2 {
-				rf.commitIndex = i
-				break
-			}
-		}
-		if rf.commitIndex > rf.lastApplied {
-			entries := rf.store.CopyLogEntries(rf.lastApplied + 1, rf.commitIndex + 1)
-			rf.msgs.applyReq <- entries
-			rf.lastApplied = rf.commitIndex
-		}
-	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -550,95 +542,25 @@ func (rf *Raft) applierCleanup() {
 	close(rf.applyCh)
 }
 
-func (rf *Raft) persisterCleanup() {
-	close(rf.msgs.storageResp)
-}
-
-func (rf *Raft) storageRequestFromAppendRequest(appReq AppendRequest) StorageRequest {
-	successMatchIndex := appReq.reply.RetryMatchIndex
-	if !appReq.reply.Success || successMatchIndex == appReq.args.PrevLogIndex + len(appReq.args.Entries) {
-		return StorageRequest{operation: StorageNoop}
-	}
-	appReq.reply.RetryMatchIndex = IndexNone
-	// if successMatchIndex == rf.store.LastLogIndex() - len(appReq.args.Entries) {
-	// 	return rf.storageRequestAppend(appReq, appReq.args.Entries[successMatchIndex - appReq.args.PrevLogIndex :]...)
-	// } else {
-		return rf.storageRequestAmend(appReq, successMatchIndex + 1, appReq.args.Entries[successMatchIndex - appReq.args.PrevLogIndex :]...)
-	// }
-}
-
-func (rf *Raft) storageRequestAppend(origAppReq AppendRequest, entries ...LogEntry) StorageRequest {
-	return StorageRequest {
-		operation: StorageAppend,
-		entries: entries,
-		origAppReq: origAppReq,
-	}
-}
-
-func (rf *Raft) storageRequestAmend(origAppReq AppendRequest, suffix int, entries ...LogEntry) StorageRequest {
-	return StorageRequest{
-		operation: StorageAmend,
-		suffix: suffix,
-		entries: entries,
-		origAppReq: origAppReq,
-	}
-}
-
-func (rf *Raft) mergeStorageRequest(reqs []StorageRequest) StorageRequest {
-	startingIndex := rf.store.Storage().FirstLogIndex()
-	endingIndex := rf.store.Storage().LastLogIndex() + 1
-	mergedReq := StorageRequest{
-		operation: StorageTrimAndAmend, 
-		prefix: startingIndex, 
-		suffix: endingIndex, 
-		entries: make([]LogEntry, 0),
-	}
-	for i := range reqs {
-		switch reqs[i].operation {
-			case StorageAppend:
-				reqs[i].prefix, reqs[i].suffix = mergedReq.prefix, mergedReq.suffix + len(mergedReq.entries)
-			case StorageAmend:
-				reqs[i].prefix = mergedReq.prefix
-			case StorageTrim:
-				reqs[i].suffix = mergedReq.suffix
-				reqs[i].entries = nil
-			default:
-				panic("Invalid storage operation")
-		}
-		if reqs[i].prefix > mergedReq.prefix {
-			mergedReq.prefix = reqs[i].prefix
-		}		
-		if reqs[i].suffix < mergedReq.suffix {
-			mergedReq.suffix = reqs[i].suffix
-			mergedReq.entries = reqs[i].entries
-		} else {
-			mergedReq.entries = append(mergedReq.entries[: reqs[i].suffix - mergedReq.suffix], reqs[i].entries...)
-		}
-	}
-	if mergedReq.prefix == startingIndex && mergedReq.suffix == endingIndex {
-		if len(mergedReq.entries) != 0 {
-			mergedReq.operation = StorageAppend
-		} else {
-			mergedReq.operation = StorageNoop
-		}
-	} else if mergedReq.prefix == startingIndex {
-		mergedReq.operation = StorageAmend
-	} else if mergedReq.suffix == endingIndex {
-		mergedReq.operation = StorageTrim
-	}
-	return mergedReq
-}
-
 func (rf *Raft) countLogReplicas(index int) int {
 	count := 0
 	for i := 0; i < len(rf.peers); i++ {
-		// if i != rf.me, matchIndex is only valid when the server is a leader, will be reinitialized upon new leader elected
-		// if i == rf.me, matchIndex represents the index of the last log entry persisted in self storage, it is always valid and will not be reinitialized if it's role hanged
+		// if i == rf.me, matchIndex represents the index of the last log entry persisted in leader's self storage
 		if rf.matchIndex[i] >= index {
 			count++
 		}
 	}
 	return count
+}
+
+func (rf *Raft) leaderWaitFlush() {
+	rf.steppedDown.Store(true)
+	rf.msgs.storageReq <- StorageRequest{}
+	for resp := range rf.msgs.storageResp {
+		if resp.firstLogIndex == IndexNone {
+			break
+		}
+	}
 }
 
 func (rf *Raft) randomizedElectionTimeout() time.Duration {
@@ -679,12 +601,7 @@ func (rf *Raft) run() {
 
 			LogPrint(dLog2, "S%d Receiving AppendEntries From: S%d Term: %d PrevLogIndex: %d PrevLogTerm: %d Entries: %v LeaderCommit: %d RequestTerm: %d", rf.me, req.args.LeaderId, rf.store.CurrentTerm(), req.args.PrevLogIndex, req.args.PrevLogTerm, req.args.Entries, req.args.LeaderCommit, req.args.Term)
 			*req.reply = *rf.AppendEntries(req.args)
-			storageReq := rf.storageRequestFromAppendRequest(req)
-			if storageReq.operation != StorageNoop {
-				rf.msgs.storageReq <- storageReq
-			} else {
-				close(req.done)
-			}
+			close(req.done)
 
 		case resp := <-rf.msgs.appResp:
 
@@ -710,10 +627,10 @@ func (rf *Raft) run() {
 		case req := <-rf.msgs.startCmdReq:
 
 			if rf.state == StateLeader {
-				rf.store.Cache().AppendLogs(LogEntry{rf.store.CurrentTerm(), req.args})
+				rf.store.AppendLogs(LogEntry{rf.store.CurrentTerm(), req.args})
+				rf.msgs.storageReq <- StorageRequest{}
 				LogPrint(dLeader, "S%d Starting Command: %v Term: %d Index: %d", rf.me, req.args, rf.store.CurrentTerm(), rf.store.LastLogIndex())
 				rf.broadcastAppendEntriesAsync()
-				rf.msgs.storageReq <- rf.storageRequestAppend(AppendRequest{}, LogEntry{rf.store.CurrentTerm(), req.args})
 				rf.resetHeartbeatTimer(rf.stableHeartbeatTimeout())
 				*req.reply = StartCommandReply{rf.store.LastLogIndex(), rf.store.CurrentTerm(), true}
 			} else {
@@ -738,8 +655,8 @@ func (rf *Raft) run() {
 
 		case resp := <- rf.msgs.storageResp:
 			
-			LogPrint(dPersist, "S%d Storage Completed FirstLogIndex: %d LastLogIndex: %d", rf.me, resp.firstLogIndex, resp.lastLogIndex)
-			rf.storageReturn(resp.firstLogIndex, resp.lastLogIndex, resp.lastLogTerm , resp.origAppReqs)
+			LogPrint(dPersist, "S%d Storage Completed Term:%d Memory: %d-%d Storage: %d-%d", rf.me, rf.store.CurrentTerm(), rf.store.FirstLogIndex(), rf.store.LastLogIndex(), resp.firstLogIndex, resp.lastLogIndex)
+			rf.storageReturn(resp.firstLogIndex, resp.lastLogIndex)
 		
 		case <-rf.msgs.shutdown:
 
@@ -781,52 +698,41 @@ func (rf *Raft) applier() {
 }
 
 func (rf *Raft) persister() {
-persister_loop:	
-	for req := range rf.msgs.storageReq {
-		batchReq := []StorageRequest{req}
-		origAppReqs :=  []AppendRequest{req.origAppReq}
-		LogPrint(dPersist, "S%d Storage Request Operation: %d Prefix: %d Suffix: %d Entries: %v", rf.me, req.operation, req.prefix, req.suffix, req.entries)
-batching_loop: 
+persister_loop:
+	for range rf.msgs.storageReq {
+batching_loop:
 		for {
 			select {
-				case more, ok := <-rf.msgs.storageReq:
+				case _, ok := <-rf.msgs.storageReq:
 					if !ok {
 						break persister_loop
 					}
-					LogPrint(dPersist, "S%d Batch Storage Request Operation: %d Prefix: %d Suffix: %d Entries: %v", rf.me, more.operation, more.prefix, more.suffix, more.entries)
-					batchReq = append(batchReq, more)
-					origAppReqs = append(origAppReqs, more.origAppReq)
-				default: // zero-latency batch
+				default: // no-latency batching
 					break batching_loop
 			}
 		}
-		if len(batchReq) > 1 {
-			req = rf.mergeStorageRequest(batchReq)
+		first, last := rf.store.FlushLogs()
+		rf.msgs.storageResp <- StorageResponse{first, last}
+		if rf.steppedDown.Load() {
+			rf.msgs.storageResp <- StorageResponse{IndexNone, IndexNone}
+			return
 		}
-		switch req.operation {
-			case StorageAppend:
-				rf.store.Storage().AppendLogs(req.entries...)
-			case StorageAmend:
-				rf.store.Storage().AmendLogs(req.suffix, req.entries...)
-			case StorageTrim:
-				rf.store.Storage().TrimLogs(req.prefix)
-			case StorageTrimAndAmend:
-				rf.store.Storage().TrimAndAmendLogs(req.prefix, req.suffix, req.entries...)
-			default:
-				panic("Invalid storage operation")
-		}
-		rf.msgs.storageResp <- StorageResponse{rf.store.Storage().FirstLogIndex(), rf.store.Storage().LastLogIndex(), rf.store.Storage().LastLogTerm(), origAppReqs}
 	}
-	rf.persisterCleanup()
 }
 
 func (rf *Raft) becomeFollower() {
+	if rf.state == StateLeader {
+		rf.leaderWaitFlush()
+	}
 	rf.resetElectionTimer(rf.randomizedElectionTimeout())
 	rf.state = StateFollower
 	rf.leader = LeaderNone
 }
 
 func (rf *Raft) becomeCandidate() {
+	if rf.state == StateLeader {
+		rf.leaderWaitFlush()
+	}
 	rf.state = StateCandidate
 	rf.leader = LeaderNone
 	rf.startElection()
@@ -840,10 +746,11 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = rf.store.LastLogIndex() + 1
 	}
 	for i:=0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			rf.matchIndex[i] = IndexStart
-		}
+		rf.matchIndex[i] = IndexStart
 	}
+	rf.matchIndex[rf.me] = rf.store.LastLogIndex()
+	rf.steppedDown.Store(false)
+	go rf.persister()
 }
 
 func (rf *Raft) startElection() {
@@ -885,14 +792,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
 	rf.store = MakeLabPersister(persister)
-	rf.matchIndex[rf.me] = rf.store.LastLogIndex()
 
 	// start ticker goroutine to start elections
 	// go rf.ticker()
 	rf.becomeFollower()
 	go rf.runner()
 	go rf.applier()
-	go rf.persister()
 
 	return rf
 }
