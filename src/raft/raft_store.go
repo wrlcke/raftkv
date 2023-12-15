@@ -19,21 +19,28 @@ type RaftStore interface {
 
 	FirstLogIndex() int                       // First log index in log array
 	LastLogIndex() int                        // Last log index in log array
-	LastLogTerm() int                         // Last log term in log array
+	LogTerm(index int) int                    // Get log term at index
 	Log(index int) *LogEntry                  // Get log at index
 	Logs(start int, end int) []LogEntry       // Get a copy of logs from start (inclusive) to end (exclusive) 
 	AppendLogs(logs ...LogEntry)              // Append logs to log array
-	RemoveLogPrefix(end int)                  // Remove logs before end (exlusive)
+	RemoveLogPrefix(end int)                  // Remove logs before end (exlusive), and end will be preserved with corresponding term but no command
 	RemoveLogSuffix(start int)                // Remove logs after start (inclusive)
+	ResetLog(lastIndex int, lastTerm int)     // Reset log array to contain only one entry with given index and term, used when a snapshot is installed from leader
 
 	FlushLogs()  (int, int)                   // Flush logs to storage
+
+	SetSnapshot(snapshot Snapshot)            // Set snapshot (make sure the data will not be modified after calling this function)
+	Snapshot() Snapshot					      // Get snapshot (make sure the return value only be read)
 }
+
+type Snapshot []byte
 
 type MemoryRaftStore struct {
 	currentTerm int
 	votedFor int
-	firstLogIndex int
+	startLogIndex int             // startLogIndex is the global index of log[0] after a snapshot, representing the last log entry in the snapshot. Its term is used for matching purposes when sending RPCs, and log[1] onwards are the actual logs, log[1]'s index will be the FirstLogIndex()
 	log []LogEntry
+	snapshot []byte
 }
 
 func (ms *MemoryRaftStore) CurrentTerm() int {
@@ -58,24 +65,24 @@ func (ms *MemoryRaftStore) SetCurrentTermAndVotedFor(term int, votedFor int) {
 }
 
 func (ms *MemoryRaftStore) FirstLogIndex() int {
-	return ms.firstLogIndex
+	return ms.startLogIndex + 1
 }
 
 func (ms *MemoryRaftStore) LastLogIndex() int {
-	return len(ms.log) - 1 + ms.firstLogIndex
+	return len(ms.log) - 1 + ms.startLogIndex
 }
 
-func (ms *MemoryRaftStore) LastLogTerm() int {
-	return ms.log[len(ms.log) - 1].Term
+func (ms *MemoryRaftStore) LogTerm(index int) int {
+	return ms.log[index - ms.startLogIndex].Term
 }
 
 func (ms *MemoryRaftStore) Log(index int) *LogEntry {
-	return &ms.log[index - ms.firstLogIndex]
+	return &ms.log[index - ms.startLogIndex]
 }
 
 func (ms *MemoryRaftStore) Logs(start int, end int) []LogEntry {
 	dst := make([]LogEntry, end - start)
-	copy(dst, ms.log[start - ms.firstLogIndex : end - ms.firstLogIndex])
+	copy(dst, ms.log[start - ms.startLogIndex : end - ms.startLogIndex])
 	return dst
 }
 
@@ -84,13 +91,28 @@ func (ms *MemoryRaftStore) AppendLogs(logs ...LogEntry) {
 }
 
 func (ms *MemoryRaftStore) RemoveLogPrefix(end int) {
-	copy(ms.log, ms.log[end - ms.firstLogIndex:])
-	ms.log = ms.log[:len(ms.log) - end + ms.firstLogIndex]
-	ms.firstLogIndex = end
+	copy(ms.log, ms.log[end - ms.startLogIndex:])
+	ms.log = ms.log[:len(ms.log) - end + ms.startLogIndex]
+	ms.log[0].Command = nil
+	ms.startLogIndex = end
 }
 
 func (ms *MemoryRaftStore) RemoveLogSuffix(start int) {
-	ms.log = ms.log[:start - ms.firstLogIndex]
+	ms.log = ms.log[:start - ms.startLogIndex]
+}
+
+func (ms *MemoryRaftStore) ResetLog(lastIndex int, lastTerm int) {
+	ms.startLogIndex = lastIndex
+	ms.log[0] = LogEntry{lastTerm, nil}
+	ms.log = ms.log[:1]
+}
+
+func (ms *MemoryRaftStore) SetSnapshot(snapshot Snapshot) {
+	ms.snapshot = snapshot
+}
+
+func (ms *MemoryRaftStore) Snapshot() Snapshot {
+	return ms.snapshot
 }
 
 type LabPersister struct {
@@ -101,13 +123,16 @@ type LabPersister struct {
 
 func MakeLabPersister(persister *Persister) *LabPersister {
 	lp := &LabPersister{storage: LabPersisterStorage{persister: persister}}
-	lp.storage.readPersist(persister.ReadRaftState())
+	lp.storage.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 	memlog := make([]LogEntry, len(lp.storage.log), cap(lp.storage.log))
 	copy(memlog, lp.storage.log)
-	lp.currentTerm, lp.votedFor, lp.firstLogIndex, lp.log =
-		lp.storage.currentTerm, lp.storage.votedFor, lp.storage.firstLogIndex, memlog
+	lp.currentTerm, lp.votedFor, lp.startLogIndex, lp.log, lp.snapshot =
+		lp.storage.currentTerm, lp.storage.votedFor, lp.storage.startLogIndex, memlog, lp.storage.snapshot
 	lp.buffer.appendLogs = make([]LogEntry, 0, 2000)
-	lp.buffer.appendStartIndex = lp.LastLogIndex() + 1
+	lp.buffer.appendIndex = lp.LastLogIndex() + 1
+	lp.buffer.compactIndex = lp.startLogIndex
+	lp.buffer.resetIndex, lp.buffer.resetTerm = lp.startLogIndex, lp.LogTerm(lp.startLogIndex)
+	lp.buffer.snapshotUpdate, lp.buffer.snapshot = false, nil
 	return lp
 }
 
@@ -146,7 +171,7 @@ func (lp *LabPersister) AppendLogs(logs ...LogEntry) {
 func (lp *LabPersister) RemoveLogPrefix(end int) {
 	lp.MemoryRaftStore.RemoveLogPrefix(end)
 	lp.buffer.rw.Lock()
-	// TODO in Snapshot
+	lp.buffer.compactIndex = end
 	lp.buffer.clear = false
 	lp.buffer.rw.Unlock()
 }
@@ -154,12 +179,32 @@ func (lp *LabPersister) RemoveLogPrefix(end int) {
 func (lp *LabPersister) RemoveLogSuffix(start int) {
 	lp.MemoryRaftStore.RemoveLogSuffix(start)
 	lp.buffer.rw.Lock()
-	if start <= lp.buffer.appendStartIndex {
+	if start <= lp.buffer.appendIndex {
 		lp.buffer.appendLogs = lp.buffer.appendLogs[:0]
-		lp.buffer.appendStartIndex = start
+		lp.buffer.appendIndex = start
 	} else {
-		lp.buffer.appendLogs = lp.buffer.appendLogs[:start - lp.buffer.appendStartIndex]
+		lp.buffer.appendLogs = lp.buffer.appendLogs[:start - lp.buffer.appendIndex]
 	}
+	lp.buffer.clear = false
+	lp.buffer.rw.Unlock()
+}
+
+func (lp *LabPersister) ResetLog(lastIndex int, lastTerm int) {
+	lp.MemoryRaftStore.ResetLog(lastIndex, lastTerm)
+	lp.buffer.rw.Lock()
+	lp.buffer.resetIndex, lp.buffer.resetTerm = lastIndex, lastTerm
+	lp.buffer.appendIndex = lastIndex + 1
+	lp.buffer.appendLogs = lp.buffer.appendLogs[:0]
+	lp.buffer.compactIndex = lastIndex
+	lp.buffer.clear = false
+	lp.buffer.rw.Unlock()
+}
+
+func (lp *LabPersister) SetSnapshot(snapshot Snapshot) {
+	lp.MemoryRaftStore.SetSnapshot(snapshot)
+	lp.buffer.rw.Lock()
+	lp.buffer.snapshot = snapshot
+	lp.buffer.snapshotUpdate = true
 	lp.buffer.clear = false
 	lp.buffer.rw.Unlock()
 }
@@ -171,10 +216,28 @@ func (lp *LabPersister) FlushLogs() (int, int) {
 		return lp.storage.FirstLogIndex(), lp.storage.LastLogIndex()
 	}
 	lp.storage.rw.Lock()
-	lp.storage.log = append(lp.storage.log[:lp.buffer.appendStartIndex - lp.storage.firstLogIndex], lp.buffer.appendLogs...)
+	// The buffer applying order here: reset -> append -> compact -> snapshot, is important
+	if lp.buffer.resetIndex > lp.storage.startLogIndex {
+		lp.storage.ResetLog(lp.buffer.resetIndex, lp.buffer.resetTerm)
+	}
+	if lp.buffer.appendIndex < lp.storage.LastLogIndex() + 1 {
+		lp.storage.RemoveLogSuffix(lp.buffer.appendIndex)
+	}
+	if len(lp.buffer.appendLogs) > 0 {
+		lp.storage.AppendLogs(lp.buffer.appendLogs...)
+	}
+	if lp.buffer.compactIndex > lp.storage.startLogIndex {
+		lp.storage.RemoveLogPrefix(lp.buffer.compactIndex)
+	}
+	if lp.buffer.snapshotUpdate {
+		lp.storage.SetSnapshot(lp.buffer.snapshot)
+	}
 	lp.storage.rw.Unlock()
 	lp.buffer.appendLogs = lp.buffer.appendLogs[:0]
-	lp.buffer.appendStartIndex = lp.storage.LastLogIndex() + 1
+	lp.buffer.appendIndex = lp.storage.LastLogIndex() + 1
+	lp.buffer.compactIndex = lp.storage.startLogIndex
+	lp.buffer.resetIndex, lp.buffer.resetTerm = lp.storage.startLogIndex, lp.storage.LogTerm(lp.storage.startLogIndex)
+	lp.buffer.snapshotUpdate, lp.buffer.snapshot = false, nil
 	lp.buffer.clear = true
 	lp.buffer.rw.Unlock()
 	lp.storage.persist()
@@ -209,25 +272,27 @@ func (lps *LabPersisterStorage) persist() {
 	defer lps.rw.RUnlock()
 	e.Encode(lps.currentTerm)
 	e.Encode(lps.votedFor)
-	e.Encode(lps.firstLogIndex)
+	e.Encode(lps.startLogIndex)
 	e.Encode(lps.log)
 	raftstate := w.Bytes()
-	lps.persister.Save(raftstate, nil)
+	lps.persister.Save(raftstate, lps.snapshot)
 }
 
 // restore previously persisted state.
-func (lps *LabPersisterStorage) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+func (lps *LabPersisterStorage) readPersist(raftstate []byte, snapshot []byte) {
+	if raftstate == nil || len(raftstate) < 1 { // bootstrap without any state?
 		lps.currentTerm = TermStart
 		lps.votedFor = VotedForNone
-		lps.firstLogIndex = IndexStart
-		lps.log = make([]LogEntry, IndexStart + 1, 10000)
+		lps.startLogIndex = IndexStart
+		lps.log = make([]LogEntry, 1, 10000)
+		lps.log[0].Term, lps.log[0].Command = TermStart, nil
+		lps.snapshot = nil
 		lps.persist()
 		return
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
+	// r := bytes.NewBuffer(raftstate)
 	// d := labgob.NewDecoder(r)
 	// var xxx
 	// var yyy
@@ -238,21 +303,30 @@ func (lps *LabPersisterStorage) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-	r := bytes.NewBuffer(data)
+	r := bytes.NewBuffer(raftstate)
 	d := labgob.NewDecoder(r)
 	lps.rw.Lock()
 	defer lps.rw.Unlock()
-	if d.Decode(&lps.currentTerm) != nil || d.Decode(&lps.votedFor) != nil || d.Decode(&lps.firstLogIndex) != nil || d.Decode(&lps.log) != nil {
+	if d.Decode(&lps.currentTerm) != nil ||
+		d.Decode(&lps.votedFor) != nil ||
+		d.Decode(&lps.startLogIndex) != nil ||
+		d.Decode(&lps.log) != nil {
 		panic("Error reading persisted state")
 	}
+	lps.snapshot = snapshot
 	// Expand capacity to reduce memory allocation for subsequent append operations
 	lps.log = append(make([]LogEntry, 0, 10000), lps.log...) 
 }
 
 // The buffer track the unpersisted logs in memory 
 type LabPersisterBuffer struct {
-	appendStartIndex int
+	appendIndex int
 	appendLogs []LogEntry
+	compactIndex int
+	resetIndex int
+	resetTerm int
+	snapshotUpdate bool
+	snapshot Snapshot
 	clear bool
 	rw sync.RWMutex
 }

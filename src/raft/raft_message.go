@@ -40,6 +40,18 @@ type VoteResponse struct {
 	reply *RequestVoteReply
 }
 
+type SnapRequest struct {
+	args *InstallSnapshotArgs
+	reply *InstallSnapshotReply
+	done chan struct{}
+}
+
+type SnapResponse struct {
+	server int
+	args *InstallSnapshotArgs
+	reply *InstallSnapshotReply
+}
+
 type GetStateRequest struct {
 	reply *GetStateReply
 	done chan struct{}
@@ -51,9 +63,17 @@ type StartCommandRequest struct {
 	done chan struct{}
 }
 
-type ApplyRequest []LogEntry
+type StartSnapshotRequest struct {
+	index int
+	snapshot []byte
+	done chan struct{}
+}
 
-type StorageRequest struct {}
+type ApplyRequest ApplyMsg
+
+type StorageRequest struct {
+	done chan struct{}
+}
 
 type StorageResponse struct {
 	firstLogIndex int
@@ -66,8 +86,11 @@ type RaftMessages struct {
 	appResp chan AppendResponse
 	voteReq chan VoteRequest
 	voteResp chan VoteResponse
+	snapReq chan SnapRequest
+	snapResp chan SnapResponse
 	getStateReq chan GetStateRequest
 	startCmdReq chan StartCommandRequest
+	startSnapReq chan StartSnapshotRequest
 	electionT <-chan time.Time
 	heartbeatT <-chan time.Time
 	storageResp chan StorageResponse
@@ -82,18 +105,24 @@ type RaftMessages struct {
 }
 
 func MakeRaftMessages() RaftMessages {
-	appReq := make(chan AppendRequest)
-	appResp := make(chan AppendResponse)
-	voteReq := make(chan VoteRequest)
-	voteResp := make(chan VoteResponse)
-	getStateReq := make(chan GetStateRequest)
-	startCmdReq := make(chan StartCommandRequest)
-	storageResp := make(chan StorageResponse, 1000)
-	applyReq := make(chan ApplyRequest, 1000)
-	storageReq := make(chan StorageRequest, 1000)
-	externalRoutines := RaftMessageWaitGroup{&sync.RWMutex{}}
-	shutdown := make(chan struct{}) 
-	return RaftMessages{ appReq, appResp, voteReq, voteResp, getStateReq, startCmdReq, nil, nil, storageResp, applyReq, storageReq, externalRoutines, shutdown }
+	return RaftMessages{
+		appReq: make(chan AppendRequest),
+		appResp: make(chan AppendResponse),
+		voteReq: make(chan VoteRequest),
+		voteResp: make(chan VoteResponse),
+		snapReq: make(chan SnapRequest),
+		snapResp: make(chan SnapResponse),
+		getStateReq: make(chan GetStateRequest),
+		startCmdReq: make(chan StartCommandRequest),
+		startSnapReq: make(chan StartSnapshotRequest),
+		electionT: chan time.Time(nil),
+		heartbeatT: chan time.Time(nil),
+		storageResp: make(chan StorageResponse, 1000),
+		applyReq: make(chan ApplyRequest, 1000),
+		storageReq: make(chan StorageRequest, 1000),
+		externalRoutines: RaftMessageWaitGroup{},
+		shutdown: make(chan struct{}),
+	}
 }
 
 // This waitgroup is designed to wait for all message sender goroutines 
@@ -124,7 +153,7 @@ func MakeRaftMessages() RaftMessages {
 // However, it's important to note that the requirement itself is not to protect shared memory, 
 // but rather to block until previous readers have completed.
 type RaftMessageWaitGroup struct {
-	rw *sync.RWMutex
+	rw sync.RWMutex
 }
 
 func (wg *RaftMessageWaitGroup) add() {
