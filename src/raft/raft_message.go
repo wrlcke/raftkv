@@ -69,7 +69,12 @@ type StartSnapshotRequest struct {
 	done chan struct{}
 }
 
-type ApplyRequest ApplyMsg
+type ApplyRequest struct {
+	index int
+	term int
+	entries []LogEntry
+	snapshot Snapshot
+}
 
 type StorageRequest struct {
 	done chan struct{}
@@ -99,7 +104,9 @@ type RaftMessages struct {
 	// Messages handled by Raft.persister
 	storageReq chan StorageRequest
 	// External goroutines that call raft's service methods (rpc service or exposed API) and send messages to Raft.runner
-	externalRoutines RaftMessageWaitGroup
+	externalRoutines RWLockWaitGroup
+	// Internal goroutines that are Raft.runner's, Raft.applier's, Raft.persister's
+	internalRoutines MultiWaitGroup
 	// Shutdown signal for runner (Kill() waits for all previous external goroutines, and then use this signal to shutdown runner)
 	shutdown chan struct{}
 }
@@ -117,10 +124,11 @@ func MakeRaftMessages() RaftMessages {
 		startSnapReq: make(chan StartSnapshotRequest),
 		electionT: chan time.Time(nil),
 		heartbeatT: chan time.Time(nil),
-		storageResp: make(chan StorageResponse, 1000),
+		storageResp: chan StorageResponse(nil),
 		applyReq: make(chan ApplyRequest, 1000),
-		storageReq: make(chan StorageRequest, 1000),
-		externalRoutines: RaftMessageWaitGroup{},
+		storageReq: chan StorageRequest(nil),
+		externalRoutines: RWLockWaitGroup{},
+		internalRoutines: MultiWaitGroup{},
 		shutdown: make(chan struct{}),
 	}
 }
@@ -152,19 +160,44 @@ func MakeRaftMessages() RaftMessages {
 // Instead, a read-write lock is more suitable for this requirement. 
 // However, it's important to note that the requirement itself is not to protect shared memory, 
 // but rather to block until previous readers have completed.
-type RaftMessageWaitGroup struct {
+type RWLockWaitGroup struct {
 	rw sync.RWMutex
 }
 
-func (wg *RaftMessageWaitGroup) add() {
+func (wg *RWLockWaitGroup) add() {
 	wg.rw.RLock()
 }
 
-func (wg *RaftMessageWaitGroup) done() {
+func (wg *RWLockWaitGroup) done() {
 	wg.rw.RUnlock()
 }
 
-func (wg *RaftMessageWaitGroup) wait() {
+func (wg *RWLockWaitGroup) wait() {
 	wg.rw.Lock()
 	defer wg.rw.Unlock()
+}
+
+type MultiWaitGroup struct {
+	mp sync.Map
+}
+
+func (mwg *MultiWaitGroup) add(key ...interface{}) {
+	for _, k := range key {
+		wg, _ := mwg.mp.LoadOrStore(k, &sync.WaitGroup{})
+		wg.(*sync.WaitGroup).Add(1)
+	}
+}
+
+func (mwg *MultiWaitGroup) done(key ...interface{}) {
+	for _, k := range key {
+		wg, _ := mwg.mp.Load(k)
+		wg.(*sync.WaitGroup).Done()
+	}
+}
+
+func (mwg *MultiWaitGroup) wait(key ...interface{}) {
+	for _, k := range key {
+		wg, _ := mwg.mp.Load(k)
+		wg.(*sync.WaitGroup).Wait()
+	}
 }

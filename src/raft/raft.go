@@ -97,6 +97,9 @@ type Raft struct {
 	// volatile state on leaders
 	nextIndex []int               // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex []int              // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	inflight []int                // for each server, number of inflight append entries RPCs
+	retrying []bool               // for each server, whether the leader is retrying append entries RPCs
+	maxInflight int               // maximum number of inflight append entries RPCs
 
 	// volatile state for internal messages
 	state         RaftRoleState   // current state of the server
@@ -105,7 +108,6 @@ type Raft struct {
 	heartbeatTimer *time.Timer    // Timer for heartbeat
 	msgs          RaftMessages	  // Channel for internal messages
 	applyCh chan ApplyMsg         // Channel for sending ApplyMsg to service
-	steppedDown   atomic.Bool	  // Flag for whether the leader has stepped down, to shutdown the persister
 
 	// volatile state on candidates
 	voteCount     int  		 	  // Number of votes received
@@ -251,10 +253,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) broadcastRequestVoteAsync(args *RequestVoteArgs) {
 	for i:=0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
+		if i != rf.me {
+			go rf.sendRequestVote(i, args, &RequestVoteReply{})
 		}
-		go rf.sendRequestVote(i, args, &RequestVoteReply{})
 	}
 }
 
@@ -374,12 +375,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	// Committed entries will never be overwritten, so even we do storage asynchronously, we can update commitIndex here
 	rf.commitIndex = Max(rf.commitIndex, Min(args.LeaderCommit, rf.store.LastLogIndex()))
 	if rf.commitIndex > rf.lastApplied {
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			rf.msgs.applyReq <- ApplyRequest {
-				CommandValid: true,
-				Command: rf.store.Log(i).Command,
-				CommandIndex: i,
-			}
+		rf.msgs.applyReq <- ApplyRequest{
+			entries: rf.store.Logs(rf.lastApplied + 1, rf.commitIndex + 1),
+			index: rf.lastApplied + 1,
 		}
 		rf.lastApplied = rf.commitIndex
 	}
@@ -398,7 +396,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 }
 
-func (rf *Raft) sendAppendEntriesAsync(server int) {
+func (rf *Raft) sendAppendEntriesAsync(server int, heartbeat bool) {
+	if (rf.inflight[server] >= rf.maxInflight || rf.retrying[server]) && !heartbeat {
+		return
+	}
+	rf.inflight[server]++
 	if rf.nextIndex[server] >= rf.store.FirstLogIndex() {
 		args := &AppendEntriesArgs{}
 		args.Term = rf.store.CurrentTerm()
@@ -407,6 +409,7 @@ func (rf *Raft) sendAppendEntriesAsync(server int) {
 		args.PrevLogTerm = rf.store.LogTerm(args.PrevLogIndex)
 		args.Entries = rf.store.Logs(rf.nextIndex[server], rf.store.LastLogIndex() + 1)
 		args.LeaderCommit = rf.commitIndex
+		LogPrint(dLeader, "S%d Sending AppendEntries To: S%d Term: %d PrevLogIndex: %d PrevLogTerm: %d Entries: %d-%d LeaderCommit: %d", rf.me, server, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.PrevLogIndex + 1, args.PrevLogIndex + len(args.Entries), args.LeaderCommit)
 		go rf.sendAppendEntries(server, args, &AppendEntriesReply{})
 	} else {
 		args := &InstallSnapshotArgs{}
@@ -419,12 +422,11 @@ func (rf *Raft) sendAppendEntriesAsync(server int) {
 	}
 }
 
-func (rf *Raft) broadcastAppendEntriesAsync() {
+func (rf *Raft) broadcastAppendEntriesAsync(heartbeat bool) {
 	for i:=0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
+		if i != rf.me {
+			rf.sendAppendEntriesAsync(i, heartbeat)
 		}
-		rf.sendAppendEntriesAsync(i)
 	}
 }
 
@@ -443,12 +445,14 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 	if reply.Term < rf.store.CurrentTerm() || args.Term != rf.store.CurrentTerm() || rf.state != StateLeader {
 		return
 	}
+	rf.inflight[server]--
 	if reply.Success {
 		if rf.matchIndex[server] >= args.PrevLogIndex + len(args.Entries) {
 			return
 		}
 		rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
+		rf.retrying[server] = false
 		for i := rf.matchIndex[server]; i > rf.commitIndex && i > args.PrevLogIndex; i-- {
 			if rf.store.LogTerm(i) == rf.store.CurrentTerm() && rf.countLogReplicas(i) > len(rf.peers)/2 {
 				rf.commitIndex = i
@@ -456,12 +460,9 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 			}
 		}
 		if rf.commitIndex > rf.lastApplied {
-			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-				rf.msgs.applyReq <- ApplyRequest {
-					CommandValid: true,
-					Command: rf.store.Log(i).Command,
-					CommandIndex: i,
-				}
+			rf.msgs.applyReq <- ApplyRequest{
+				entries: rf.store.Logs(rf.lastApplied + 1, rf.commitIndex + 1),
+				index: rf.lastApplied + 1,
 			}
 			rf.lastApplied = rf.commitIndex
 		}
@@ -485,7 +486,8 @@ func (rf *Raft) appendEntriesReturn(server int, args *AppendEntriesArgs, reply *
 				}
 			}
 			rf.nextIndex[server] = retryMatchIndex + 1
-			rf.sendAppendEntriesAsync(server)
+			rf.retrying[server] = true
+			rf.sendAppendEntriesAsync(server, false)
 		}
 	}
 }
@@ -550,10 +552,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshotReply
 	rf.commitIndex = Max(rf.commitIndex, args.LastIncludedIndex)
 	if rf.commitIndex > rf.lastApplied {
 		rf.msgs.applyReq <- ApplyRequest {
-			SnapshotValid: true,
-			Snapshot: args.Data,
-			SnapshotIndex: args.LastIncludedIndex,
-			SnapshotTerm: args.LastIncludedTerm,
+			index: args.LastIncludedIndex,
+			term: args.LastIncludedTerm,
+			snapshot: args.Data,
 		}
 		rf.lastApplied = args.LastIncludedIndex
 	}
@@ -584,11 +585,13 @@ func (rf *Raft) InstallSnapshotReturn(server int, args *InstallSnapshotArgs, rep
 	if reply.Term < rf.store.CurrentTerm() || args.Term != rf.store.CurrentTerm() || rf.state != StateLeader {
 		return
 	}
+	rf.inflight[server]--
 	if rf.matchIndex[server] >= args.LastIncludedIndex {
 		return
 	}
 	rf.nextIndex[server] = args.LastIncludedIndex + 1
 	rf.matchIndex[server] = rf.nextIndex[server] - 1
+	rf.retrying[server] = false
 	for i := rf.matchIndex[server]; i > rf.commitIndex; i-- {
 		if rf.store.LogTerm(i) == rf.store.CurrentTerm() && rf.countLogReplicas(i) > len(rf.peers)/2 {
 			rf.commitIndex = i
@@ -596,12 +599,9 @@ func (rf *Raft) InstallSnapshotReturn(server int, args *InstallSnapshotArgs, rep
 		}
 	}
 	if rf.commitIndex > rf.lastApplied {
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			rf.msgs.applyReq <- ApplyRequest {
-				CommandValid: true,
-				Command: rf.store.Log(i).Command,
-				CommandIndex: i,
-			}
+		rf.msgs.applyReq <- ApplyRequest{
+			entries: rf.store.Logs(rf.lastApplied + 1, rf.commitIndex + 1),
+			index: rf.lastApplied + 1,
 		}
 		rf.lastApplied = rf.commitIndex
 	}
@@ -617,12 +617,9 @@ func (rf *Raft) storageReturn(firstLogIndex int, lastLogIndex int) {
 			}
 		}
 		if rf.commitIndex > rf.lastApplied {
-			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-				rf.msgs.applyReq <- ApplyRequest {
-					CommandValid: true,
-					Command: rf.store.Log(i).Command,
-					CommandIndex: i,
-				}
+			rf.msgs.applyReq <- ApplyRequest{
+				entries: rf.store.Logs(rf.lastApplied + 1, rf.commitIndex + 1),
+				index: rf.lastApplied + 1,
 			}
 			rf.lastApplied = rf.commitIndex
 		}
@@ -685,15 +682,14 @@ func (rf *Raft) cleanup() {
 	rf.heartbeatTimer.Stop()
 	rf.msgs.externalRoutines.wait()
 	close(rf.msgs.shutdown)
-}
-
-func (rf *Raft) runnerCleanup() {
+	rf.msgs.internalRoutines.wait("runner")
 	close(rf.msgs.applyReq)
-	close(rf.msgs.storageReq)
-}
-
-func (rf *Raft) applierCleanup() {
+	rf.msgs.internalRoutines.wait("applier")
 	close(rf.applyCh)
+	if rf.msgs.storageReq != nil {
+		close(rf.msgs.storageReq)
+		rf.msgs.internalRoutines.wait("persister")
+	}
 }
 
 func (rf *Raft) countLogReplicas(index int) int {
@@ -708,17 +704,13 @@ func (rf *Raft) countLogReplicas(index int) int {
 }
 
 func (rf *Raft) leaderWaitFlush() {
-	rf.steppedDown.Store(true)
-	rf.msgs.storageReq <- StorageRequest{}
-	for resp := range rf.msgs.storageResp {
-		if resp.firstLogIndex == IndexNone {
-			break
-		}
-	}
+	close(rf.msgs.storageReq)
+	rf.msgs.internalRoutines.wait("persister")
+	rf.msgs.storageReq = nil
 }
 
 func (rf *Raft) randomizedElectionTimeout() time.Duration {
-	return time.Duration(300 + (rand.Intn(200))) * time.Millisecond
+	return time.Duration(500 + (rand.Intn(300))) * time.Millisecond
 }
 
 func (rf *Raft) stableHeartbeatTimeout() time.Duration {
@@ -753,13 +745,14 @@ func (rf *Raft) run() {
 	select {
 		case req := <-rf.msgs.appReq:
 
-			LogPrint(dLog2, "S%d Receiving AppendEntries From: S%d Term: %d PrevLogIndex: %d PrevLogTerm: %d Entries: %v LeaderCommit: %d RequestTerm: %d", rf.me, req.args.LeaderId, rf.store.CurrentTerm(), req.args.PrevLogIndex, req.args.PrevLogTerm, req.args.Entries, req.args.LeaderCommit, req.args.Term)
+			LogPrint(dLog2, "S%d Receiving AppendEntries From: S%d Term: %d PrevLogIndex: %d PrevLogTerm: %d Entries: %d-%d LeaderCommit: %d RequestTerm: %d", rf.me, req.args.LeaderId, rf.store.CurrentTerm(), req.args.PrevLogIndex, req.args.PrevLogTerm, req.args.PrevLogIndex + 1, req.args.PrevLogIndex + len(req.args.Entries), req.args.LeaderCommit, req.args.Term)
 			*req.reply = *rf.AppendEntries(req.args)
+			LogPrint(dLog2, "S%d Finished AppendEntries From S%d Term: %d Success: %t PrevLogIndex: %d PrevLogTerm: %d Entries: %d-%d LeaderCommit: %d RequestTerm: %d ResponseTerm: %d", rf.me, req.args.LeaderId, rf.store.CurrentTerm(), req.reply.Success, req.args.PrevLogIndex, req.args.PrevLogTerm, req.args.PrevLogIndex + 1, req.args.PrevLogIndex + len(req.args.Entries), req.args.LeaderCommit, req.args.Term, req.reply.Term)
 			close(req.done)
 
 		case resp := <-rf.msgs.appResp:
 
-			LogPrint(dLog, "S%d AppendEntries Return From S%d Term: %d Success: %t PrevLogIndex: %d PrevLogTerm: %d Entries: %v LeaderCommit: %d RequestTerm: %d ResponseTerm: %d", rf.me, resp.server, rf.store.CurrentTerm(), resp.reply.Success, resp.args.PrevLogIndex, resp.args.PrevLogTerm, resp.args.Entries, resp.args.LeaderCommit, resp.args.Term, resp.reply.Term)
+			LogPrint(dLog, "S%d AppendEntries Return From S%d Term: %d Success: %t PrevLogIndex: %d PrevLogTerm: %d Entries: %d-%d LeaderCommit: %d RequestTerm: %d ResponseTerm: %d", rf.me, resp.server, rf.store.CurrentTerm(), resp.reply.Success, resp.args.PrevLogIndex, resp.args.PrevLogTerm, resp.args.PrevLogIndex + 1, resp.args.PrevLogIndex + len(resp.args.Entries), resp.args.LeaderCommit, resp.args.Term, resp.reply.Term)
 			rf.appendEntriesReturn(resp.server, resp.args, resp.reply)
 
 		case req := <-rf.msgs.voteReq:
@@ -775,13 +768,13 @@ func (rf *Raft) run() {
 
 		case req := <-rf.msgs.snapReq:
 
-			LogPrint(dSnap, "S%d Receiving InstallSnapshot From: S%d Term: %d LastIncludedIndex: %d LastIncludedTerm: %d Data: %v RequestTerm: %d", rf.me, req.args.LeaderId, rf.store.CurrentTerm(), req.args.LastIncludedIndex, req.args.LastIncludedTerm, req.args.Data, req.args.Term)
+			LogPrint(dSnap, "S%d Receiving InstallSnapshot From: S%d Term: %d LastIncludedIndex: %d LastIncludedTerm: %d RequestTerm: %d", rf.me, req.args.LeaderId, rf.store.CurrentTerm(), req.args.LastIncludedIndex, req.args.LastIncludedTerm, req.args.Term)
 			*req.reply = *rf.InstallSnapshot(req.args)
 			close(req.done)
 
 		case req := <- rf.msgs.snapResp:
 
-			LogPrint(dSnap, "S%d InstallSnapshot Return From S%d Term: %d LastIncludedIndex: %d LastIncludedTerm: %d Data: %v RequestTerm: %d ResponseTerm: %d", rf.me, req.server, rf.store.CurrentTerm(), req.args.LastIncludedIndex, req.args.LastIncludedTerm, req.args.Data, req.args.Term, req.reply.Term)
+			LogPrint(dSnap, "S%d InstallSnapshot Return From S%d Term: %d LastIncludedIndex: %d LastIncludedTerm: %d RequestTerm: %d ResponseTerm: %d", rf.me, req.server, rf.store.CurrentTerm(), req.args.LastIncludedIndex, req.args.LastIncludedTerm, req.args.Term, req.reply.Term)
 			rf.InstallSnapshotReturn(req.server, req.args, req.reply)
 
 		case req := <-rf.msgs.getStateReq:
@@ -792,24 +785,24 @@ func (rf *Raft) run() {
 		case req := <-rf.msgs.startCmdReq:
 
 			if rf.state == StateLeader {
-				batchReq := []StartCommandRequest{req}
+				begin_index := rf.store.LastLogIndex() + 1
+				rf.store.AppendLogs(LogEntry{rf.store.CurrentTerm(), req.args})
+				*req.reply = StartCommandReply{rf.store.LastLogIndex(), rf.store.CurrentTerm(), true}
+				close(req.done)
 			batching_loop:
 				for {
 					select {
 						case req := <-rf.msgs.startCmdReq:
-							batchReq = append(batchReq, req)
+							rf.store.AppendLogs(LogEntry{rf.store.CurrentTerm(), req.args})
+							*req.reply = StartCommandReply{rf.store.LastLogIndex(), rf.store.CurrentTerm(), true}
+							close(req.done)
 						default:
 							break batching_loop
 					}
 				}
-				for i := range batchReq {
-					rf.store.AppendLogs(LogEntry{rf.store.CurrentTerm(), batchReq[i].args})
-					LogPrint(dLeader, "S%d Starting Command: %v Term: %d Index: %d", rf.me, batchReq[i].args, rf.store.CurrentTerm(), rf.store.LastLogIndex())
-					*batchReq[i].reply = StartCommandReply{rf.store.LastLogIndex(), rf.store.CurrentTerm(), true}
-					close(batchReq[i].done)
-				}
+				LogPrint(dLeader, "S%d Starting Command Term: %d Index: %d-%d", rf.me, rf.store.CurrentTerm(), begin_index, rf.store.LastLogIndex())
 				rf.msgs.storageReq <- StorageRequest{}
-				rf.broadcastAppendEntriesAsync()
+				rf.broadcastAppendEntriesAsync(false)
 				rf.resetHeartbeatTimer(rf.stableHeartbeatTimeout())
 			} else {
 				*req.reply = StartCommandReply{IndexNone, rf.store.CurrentTerm(), false}
@@ -843,7 +836,7 @@ func (rf *Raft) run() {
 
 			if rf.state == StateLeader {
 				LogPrint(dTimer, "S%d Heartbeat Timeout Term: %d", rf.me, rf.store.CurrentTerm())
-				rf.broadcastAppendEntriesAsync()
+				rf.broadcastAppendEntriesAsync(true)
 				rf.resetHeartbeatTimer(rf.stableHeartbeatTimeout())
 			}
 
@@ -860,10 +853,10 @@ func (rf *Raft) run() {
 }
 
 func (rf *Raft) runner() {
+	defer rf.msgs.internalRoutines.done("runner")
 	for rf.running() {
 		rf.run()
 	}
-	rf.runnerCleanup()
 }
 
 func (rf *Raft) running() bool {
@@ -876,19 +869,31 @@ func (rf *Raft) running() bool {
 }
 
 func (rf *Raft) applier() {
-	for applyMsg := range rf.msgs.applyReq {
-		if applyMsg.CommandValid {
-			LogPrint(dCommit, "S%d Applying Command: %v Index: %d", rf.me, applyMsg.Command, applyMsg.CommandIndex)
+	defer rf.msgs.internalRoutines.done("applier")
+	for req := range rf.msgs.applyReq {
+		if req.snapshot != nil {
+			LogPrint(dCommit, "S%d Applying Snapshot LastIndex: %d LastTerm: %d", rf.me, req.index, req.term)
+			rf.applyCh <- ApplyMsg{
+				SnapshotValid: true,
+				Snapshot: req.snapshot,
+				SnapshotIndex: req.index,
+				SnapshotTerm: req.term,
+			}
 		} else {
-			LogPrint(dCommit, "S%d Applying Snapshot LastIndex: %d LastTerm: %d", rf.me, applyMsg.SnapshotIndex, applyMsg.SnapshotTerm)
+			LogPrint(dCommit, "S%d Applying Command: %d-%d", rf.me, req.index, req.index + len(req.entries) - 1)
+			for i := range req.entries {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command: req.entries[i].Command,
+					CommandIndex: req.index + i,
+				}
+			}
 		}
-		rf.applyCh <- ApplyMsg(applyMsg)
 	}
-	rf.applierCleanup()
 }
 
 func (rf *Raft) persister() {
-persister_loop:
+	defer rf.msgs.internalRoutines.done("persister")
 	for req := range rf.msgs.storageReq {
 		dones := []chan struct{}{req.done}
 batching_loop:
@@ -896,7 +901,7 @@ batching_loop:
 			select {
 				case more, ok := <-rf.msgs.storageReq:
 					if !ok {
-						break persister_loop
+						break batching_loop
 					}
 					dones = append(dones, more.done)
 				default: // no-latency batching
@@ -910,10 +915,6 @@ batching_loop:
 			}
 		}
 		rf.msgs.storageResp <- StorageResponse{first, last}
-		if rf.steppedDown.Load() {
-			rf.msgs.storageResp <- StorageResponse{IndexNone, IndexNone}
-			return
-		}
 	}
 }
 
@@ -941,15 +942,17 @@ func (rf *Raft) becomeLeader() {
 	rf.leader = rf.me
 	for i:=0; i < len(rf.peers); i++ { 
 		rf.nextIndex[i] = rf.store.LastLogIndex() + 1
-	}
-	for i:=0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			rf.matchIndex[i] = rf.store.LastLogIndex()
 		} else {
 			rf.matchIndex[i] = IndexStart
 		}
+		rf.inflight[i] = 0
+		rf.retrying[i] = false
 	}
-	rf.steppedDown.Store(false)
+	rf.msgs.storageReq = make(chan StorageRequest, 1000)
+	rf.msgs.storageResp = make(chan StorageResponse, 1000)
+	rf.msgs.internalRoutines.add("persister")
 	go rf.persister()
 }
 
@@ -980,6 +983,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.inflight = make([]int, len(rf.peers))
+	rf.retrying = make([]bool, len(rf.peers))
+	rf.maxInflight = 10
 
 	rf.leader = LeaderNone
 	rf.msgs	= MakeRaftMessages()
@@ -996,6 +1002,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	// go rf.ticker()
 	rf.becomeFollower()
+	rf.msgs.internalRoutines.add("runner", "applier")
 	go rf.runner()
 	go rf.applier()
 

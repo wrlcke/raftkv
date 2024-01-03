@@ -57,8 +57,7 @@ func init() {
 func LogPrint(topic logTopic, format string, a ...interface{}) {
 	if debugVerbosity >= 1 {
 		t := time.Since(debugStart).Microseconds()
-		t /= 100
-		prefix := fmt.Sprintf("%06d %v ", t, string(topic))
+		prefix := fmt.Sprintf("%09d %v ", t, string(topic))
 		format = prefix + format
 		log.Printf(format, a...)
 	}
