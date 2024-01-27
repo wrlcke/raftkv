@@ -107,8 +107,11 @@ def print_results(results: Dict[str, Dict[str, StatsMeter]], timing=False):
     print(table)
 
 
-def run_test(test: str, race: bool, profile: bool, timing: bool, timeout: Optional[str]) -> Tuple[str, Dict[str, str], int, float]:
-    test_cmd = ["go", "test", f"-run={test}"]
+def run_test(test: str, race: bool, profile: bool, timing: bool, timeout: Optional[str], bench: bool) -> Tuple[str, Dict[str, str], int, float]:
+    if bench:
+        test_cmd = ["go", "test", f"-run=NONE", f"-bench={test}"]
+    else:
+        test_cmd = ["go", "test", f"-run={test}"]
     if race:
         test_cmd.append("-race")
     if timing:
@@ -154,18 +157,22 @@ def run_tests(
     leak_check: bool       = typer.Option(False,  '--leak-check',      '-L',    help='Run with leak check'),
     profile: bool          = typer.Option(False,  '--profile',         '-P',    help='Run with profiling and generate profiles'),
     timeout: Optional[str] = typer.Option(None,   '--timeout',         '-T',    help='Timeout for each test'),
+    benchmark: bool        = typer.Option(False,  '--benchmark',       '-b',    help='Run benchmarks instead of tests'),
     # fmt: on
 ):
 
     if output is None:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output = Path(timestamp)
+    
+    if benchmark:
+        print("[yellow]Running benchmarks[/yellow]")
 
     if race:
-        print("[yellow]Running with the race detector\n[/yellow]")
+        print("[yellow]Running with the race detector[/yellow]")
 
     if verbose > 0:
-        print(f"[yellow] Verbosity level set to {verbose}[/yellow]")
+        print(f"[yellow]Verbosity level set to {verbose}[/yellow]")
         os.environ['VERBOSE'] = str(verbose)
 
     if leak_check:
@@ -226,7 +233,7 @@ def run_tests(
                     n = len(futures)
                     if n < workers:
                         for test in itertools.islice(test_instances, workers-n):
-                            futures.append(executor.submit(run_test, test, race, profile, timing, timeout))
+                            futures.append(executor.submit(run_test, test, race, profile, timing, timeout, benchmark))
 
                     done, not_done = wait(futures, return_when=FIRST_COMPLETED)
 

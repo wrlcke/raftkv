@@ -8,14 +8,17 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
-import "os"
-import "go.uber.org/goleak"
+import (
+	"fmt"
+	"math/rand"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"go.uber.org/goleak"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -28,7 +31,7 @@ func getLeakCheck() bool {
 
 func TestMain(m *testing.M) {
 	if getLeakCheck() {
-		goleak.VerifyTestMain(m, goleak.IgnoreAnyFunction("6.5840/labrpc.(*ClientEnd).Call"))
+		goleak.VerifyTestMain(m)
 	} else {
 		ec := m.Run()
 		os.Exit(ec)

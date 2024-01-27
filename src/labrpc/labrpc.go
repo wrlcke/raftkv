@@ -49,44 +49,90 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "6.5840/labgob"
-import "bytes"
-import "reflect"
-import "sync"
-import "log"
-import "strings"
-import "math/rand"
-import "time"
-import "sync/atomic"
+import (
+	"bytes"
+	"log"
+	"math/rand"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+)
 
 type reqMsg struct {
 	endname  interface{} // name of sending ClientEnd
 	svcMeth  string      // e.g. "Raft.AppendEntries"
+	seq      int64       // sequence number; unique per ClientEnd
 	argsType reflect.Type
 	args     []byte
 	replyCh  chan replyMsg
+	done     chan struct{} // closed when Network is cleaned up
 }
 
 type replyMsg struct {
+	seq   int64
 	ok    bool
 	reply []byte
 }
 
+// Call represents an active RPC.
+type Call struct {
+	ServiceMethod string      // The name of the service and method to call.
+	Args          interface{} // The argument to the function (*struct).
+	Reply         interface{} // The reply from the function (*struct).
+	Ok            bool        // Did the call complete successfully?
+	Done          chan *Call  // Receives *Call when Go is complete.
+}
+
 type ClientEnd struct {
-	endname interface{}   // this end-point's name
-	ch      chan reqMsg   // copy of Network.endCh
-	done    chan struct{} // closed when Network is cleaned up
+	endname interface{}     // this end-point's name
+	ch      chan reqMsg     // copy of Network.endCh
+	replyCh chan replyMsg   // all replies to this ClientEnd
+	mu      sync.Mutex      // protecting seq and pending
+	seq     int64           // each ClientEnd has a unique sequence number for requests
+	pending map[int64]*Call // map request sequence numbers to outstanding calls
+	done    chan struct{}   // closed when Network is cleaned up
 }
 
 // send an RPC, wait for the reply.
 // the return value indicates success; false means that
 // no reply was received from the server.
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
+	call := e.Go(svcMeth, args, reply, make(chan *Call, 1))
+	<-call.Done
+	return call.Ok
+}
+
+// send an RPC, wait for the reply.
+// the return value indicates success; false means that
+// no reply was received from the server.
+func (e *ClientEnd) Go(svcMeth string, args interface{}, reply interface{}, done chan *Call) *Call {
+	call := &Call{}
+	call.ServiceMethod = svcMeth
+	call.Args = args
+	call.Reply = reply
+	if done == nil {
+		call.Done = make(chan *Call, 1) // buffered
+	} else {
+		call.Done = done
+	}
+
+	e.mu.Lock()
+	seq := e.seq
+	e.seq++
+	e.pending[seq] = call
+	e.mu.Unlock()
+
 	req := reqMsg{}
 	req.endname = e.endname
 	req.svcMeth = svcMeth
+	req.seq = seq
 	req.argsType = reflect.TypeOf(args)
-	req.replyCh = make(chan replyMsg)
+	req.replyCh = e.replyCh
+	req.done = e.done
 
 	qb := new(bytes.Buffer)
 	qe := labgob.NewEncoder(qb)
@@ -103,22 +149,66 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 		// the request has been sent.
 	case <-e.done:
 		// entire Network has been destroyed.
-		return false
+		e.mu.Lock()
+		call = e.pending[seq]
+		delete(e.pending, seq)
+		e.mu.Unlock()
+		if call != nil {
+			call.Ok = false
+			call.done()
+		}
 	}
 
-	//
-	// wait for the reply.
-	//
-	rep := <-req.replyCh
-	if rep.ok {
-		rb := bytes.NewBuffer(rep.reply)
-		rd := labgob.NewDecoder(rb)
-		if err := rd.Decode(reply); err != nil {
-			log.Fatalf("ClientEnd.Call(): decode reply: %v\n", err)
+	return call
+}
+
+func (e *ClientEnd) input() {
+	for {
+		select {
+		case rep := <-e.replyCh:
+			e.mu.Lock()
+			call := e.pending[rep.seq]
+			delete(e.pending, rep.seq)
+			e.mu.Unlock()
+
+			if call == nil {
+				continue
+			}
+			call.Ok = rep.ok
+			if rep.ok {
+				rb := bytes.NewBuffer(rep.reply)
+				rd := labgob.NewDecoder(rb)
+				if err := rd.Decode(call.Reply); err != nil {
+					log.Fatalf("ClientEnd.Call(): decode reply: %v\n", err)
+				}
+			}
+			call.done()
+		case <-e.done:
+			e.mu.Lock()
+			for seq, call := range e.pending {
+				call.Ok = false
+				call.done()
+				delete(e.pending, seq)
+			}
+			e.mu.Unlock()
+			return
 		}
-		return true
-	} else {
-		return false
+	}
+}
+
+func (call *Call) done() {
+	select {
+	case call.Done <- call:
+		// ok
+	default:
+	}
+}
+
+func (req *reqMsg) reply(reply replyMsg) {
+	select {
+	case req.replyCh <- reply:
+		// ok
+	case <-req.done:
 	}
 }
 
@@ -227,7 +317,8 @@ func (rn *Network) processReq(req reqMsg) {
 
 		if reliable == false && (rand.Int()%1000) < 100 {
 			// drop the request, return as if timeout
-			req.replyCh <- replyMsg{false, nil}
+			// req.replyCh <- replyMsg{req.seq, false, nil}
+			req.reply(replyMsg{req.seq, false, nil})
 			return
 		}
 
@@ -271,10 +362,12 @@ func (rn *Network) processReq(req reqMsg) {
 
 		if replyOK == false || serverDead == true {
 			// server was killed while we were waiting; return error.
-			req.replyCh <- replyMsg{false, nil}
+			// req.replyCh <- replyMsg{req.seq, false, nil}
+			req.reply(replyMsg{req.seq, false, nil})
 		} else if reliable == false && (rand.Int()%1000) < 100 {
 			// drop the reply, return as if timeout
-			req.replyCh <- replyMsg{false, nil}
+			// req.replyCh <- replyMsg{req.seq, false, nil}
+			req.reply(replyMsg{req.seq, false, nil})
 		} else if longreordering == true && rand.Intn(900) < 600 {
 			// delay the response for a while
 			ms := 200 + rand.Intn(1+rand.Intn(2000))
@@ -283,11 +376,13 @@ func (rn *Network) processReq(req reqMsg) {
 			// detector is less likely to get upset.
 			time.AfterFunc(time.Duration(ms)*time.Millisecond, func() {
 				atomic.AddInt64(&rn.bytes, int64(len(reply.reply)))
-				req.replyCh <- reply
+				// req.replyCh <- reply
+				req.reply(reply)
 			})
 		} else {
 			atomic.AddInt64(&rn.bytes, int64(len(reply.reply)))
-			req.replyCh <- reply
+			// req.replyCh <- reply
+			req.reply(reply)
 		}
 	} else {
 		// simulate no reply and eventual timeout.
@@ -302,7 +397,8 @@ func (rn *Network) processReq(req reqMsg) {
 			ms = (rand.Int() % 100)
 		}
 		time.AfterFunc(time.Duration(ms)*time.Millisecond, func() {
-			req.replyCh <- replyMsg{false, nil}
+			// req.replyCh <- replyMsg{req.seq, false, nil}
+			req.reply(replyMsg{req.seq, false, nil})
 		})
 	}
 
@@ -322,6 +418,11 @@ func (rn *Network) MakeEnd(endname interface{}) *ClientEnd {
 	e.endname = endname
 	e.ch = rn.endCh
 	e.done = rn.done
+	e.seq = 0
+	e.pending = make(map[int64]*Call)
+	e.replyCh = make(chan replyMsg)
+	go e.input()
+
 	rn.ends[endname] = e
 	rn.enabled[endname] = false
 	rn.connections[endname] = nil
@@ -423,7 +524,7 @@ func (rs *Server) dispatch(req reqMsg) replyMsg {
 		}
 		log.Fatalf("labrpc.Server.dispatch(): unknown service %v in %v.%v; expecting one of %v\n",
 			serviceName, serviceName, methodName, choices)
-		return replyMsg{false, nil}
+		return replyMsg{req.seq, false, nil}
 	}
 }
 
@@ -498,7 +599,7 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 		re := labgob.NewEncoder(rb)
 		re.EncodeValue(replyv)
 
-		return replyMsg{true, rb.Bytes()}
+		return replyMsg{req.seq, true, rb.Bytes()}
 	} else {
 		choices := []string{}
 		for k, _ := range svc.methods {
@@ -506,6 +607,6 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 		}
 		log.Fatalf("labrpc.Service.dispatch(): unknown method %v in %v; expecting one of %v\n",
 			methname, req.svcMeth, choices)
-		return replyMsg{false, nil}
+		return replyMsg{req.seq, false, nil}
 	}
 }

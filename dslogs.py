@@ -67,6 +67,8 @@ def main(
     for line in input_:
         try:
             time, topic, *msg = line.strip().split(" ")
+            if topic not in TOPICS:
+                print(line, end="")
             # To ignore some topics
             if topic not in topics:
                 continue
