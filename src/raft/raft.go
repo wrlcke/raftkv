@@ -101,8 +101,8 @@ type Raft struct {
 	// volatile state for internal messages
 	state          RaftState         // current state of the server
 	leader         int               // id of current leader (initialized to -1)
-	electionTimer  *time.Timer       // timer for election
-	heartbeatTimer *time.Timer       // timer for heartbeat
+	electionTimer  ElapsedTimer      // timer for election
+	heartbeatTimer ElapsedTimer      // timer for heartbeat
 	startCh        chan StartMessage // receiving requests from service
 	applyCh        chan ApplyMessage // sending apply messages to service
 	recvCh         chan Message      // receiving messages from transport
@@ -111,6 +111,11 @@ type Raft struct {
 
 	// volatile state on candidates
 	votes map[int]bool // votes received from peers
+}
+
+type ElapsedTimer struct {
+	*time.Timer
+	startTime time.Time
 }
 
 // return currentTerm and whether this server
@@ -194,7 +199,7 @@ func (rf *Raft) handleRequestVote(args Message) {
 			rf.send(args.From, Message{Type: MsgVoteResp, Success: false})
 			return
 		} else {
-			rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
+			rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 			rf.send(args.From, Message{Type: MsgVoteResp, Success: true})
 			return
 		}
@@ -206,7 +211,7 @@ func (rf *Raft) handleRequestVote(args Message) {
 	}
 	rf.storage.SetVotedFor(args.From)
 	rf.saveVote()
-	rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
+	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 	rf.send(args.From, Message{Type: MsgVoteResp, Success: true})
 }
 
@@ -241,12 +246,14 @@ func (rf *Raft) handlePreVote(args Message) {
 		rf.send(args.From, Message{Type: MsgPreVoteResp, Success: false})
 		return
 	}
-	if args.LogTerm < rf.storage.LogTerm(rf.storage.LastLogIndex()) ||
-		args.LogTerm == rf.storage.LogTerm(rf.storage.LastLogIndex()) && args.LogIndex < rf.storage.LastLogIndex() {
+	if rf.leader != LeaderNone && rf.electionTimer.Elapsed() < rf.baselineElectionTimeout() ||
+		args.LogTerm < rf.storage.LogTerm(rf.storage.LastLogIndex()) ||
+		args.LogTerm == rf.storage.LogTerm(rf.storage.LastLogIndex()) &&
+			args.LogIndex < rf.storage.LastLogIndex() {
 		rf.transport.Send(Message{Type: MsgPreVoteResp, From: rf.me, To: args.From, Term: args.Term, Success: false})
 		return
 	}
-	rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
+	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 	rf.transport.Send(Message{Type: MsgPreVoteResp, From: rf.me, To: args.From, Term: args.Term, Success: true})
 }
 
@@ -296,7 +303,7 @@ func (rf *Raft) handleAppendEntries(args Message) {
 		rf.becomeFollower()
 	}
 	rf.leader = args.From
-	rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
+	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 
 	if args.LogIndex > rf.storage.LastLogIndex() ||
 		args.LogIndex >= rf.storage.FirstLogIndex() &&
@@ -412,7 +419,7 @@ func (rf *Raft) handleInstallSnapshot(args Message) {
 		}
 	}
 	rf.leader = args.From
-	rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
+	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 	if args.LogIndex < rf.storage.FirstLogIndex() {
 		rf.save(args.From, Message{Type: MsgSnapReq, LogIndex: args.LogIndex, LogTerm: args.LogTerm, Snapshot: nil})
 		return
@@ -546,7 +553,7 @@ func (rf *Raft) onHeartbeatTimeout() {
 	if rf.state == StateLeader {
 		LogPrint(dTimer, "s%d heartbeat timeout", rf.me)
 		rf.broadcastReplication(true)
-		rf.resetTimer(rf.heartbeatTimer, rf.stableHeartbeatTimeout())
+		rf.heartbeatTimer.Reset(rf.stableHeartbeatTimeout())
 	}
 }
 
@@ -675,6 +682,10 @@ func (rf *Raft) searchPotentialMatch(mismatchIndex int, mismatchTerm int) (int, 
 	return retryMatchIndex, retryMatchTerm
 }
 
+func (rf *Raft) baselineElectionTimeout() time.Duration {
+	return time.Duration(500) * time.Millisecond
+}
+
 func (rf *Raft) randomizedElectionTimeout() time.Duration {
 	return time.Duration(500+(rand.Intn(300))) * time.Millisecond
 }
@@ -687,14 +698,19 @@ func (rf *Raft) immediateTimeout() time.Duration {
 	return time.Duration(0) * time.Millisecond
 }
 
-func (rf *Raft) resetTimer(timer *time.Timer, d time.Duration) {
+func (timer *ElapsedTimer) Reset(d time.Duration) {
+	timer.startTime = time.Now()
 	if !timer.Stop() {
 		select {
 		case <-timer.C:
 		default:
 		}
 	}
-	timer.Reset(d)
+	timer.Timer.Reset(d)
+}
+
+func (timer *ElapsedTimer) Elapsed() time.Duration {
+	return time.Since(timer.startTime)
 }
 
 func (rf *Raft) runner() {
@@ -869,14 +885,14 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 
 func (rf *Raft) becomeFollower() {
 	LogPrint(dInfo, "s%d become follower at term %d", rf.me, rf.storage.CurrentTerm())
-	rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
+	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 	rf.state = StateFollower
 	rf.leader = LeaderNone
 }
 
 func (rf *Raft) becomeCandidate() {
 	LogPrint(dInfo, "s%d became candidate at term %d", rf.me, rf.storage.CurrentTerm()+1)
-	rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
+	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 	rf.state = StateCandidate
 	rf.leader = LeaderNone
 	rf.startPreElection()
@@ -884,7 +900,7 @@ func (rf *Raft) becomeCandidate() {
 
 func (rf *Raft) becomeLeader() {
 	LogPrint(dInfo, "s%d became leader at term %d", rf.me, rf.storage.CurrentTerm())
-	rf.resetTimer(rf.heartbeatTimer, rf.immediateTimeout())
+	rf.heartbeatTimer.Reset(rf.immediateTimeout())
 	rf.state = StateLeader
 	rf.leader = rf.me
 	for i := 0; i < len(rf.peers); i++ {
@@ -959,8 +975,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.maxInflight = 100
 
 	rf.leader = LeaderNone
-	rf.electionTimer = time.NewTimer(rf.randomizedElectionTimeout())
-	rf.heartbeatTimer = time.NewTimer(rf.stableHeartbeatTimeout())
+	rf.electionTimer = ElapsedTimer{time.NewTimer(0), time.Now()}
+	rf.heartbeatTimer = ElapsedTimer{time.NewTimer(0), time.Now()}
 	rf.startCh = make(chan StartMessage)
 	rf.applyCh = make(chan ApplyMessage, 10000)
 	rf.recvCh = make(chan Message, 10000)
