@@ -61,7 +61,7 @@ func (t *LabRpcTransport) Start() {
 
 func (t *LabRpcTransport) Send(m Message) {
 	sendCh := t.sendReqCh[m.To]
-	if m.Type == MsgAppResp || m.Type == MsgSnapResp || m.Type == MsgVoteResp {
+	if m.Type == MsgAppResp || m.Type == MsgSnapResp || m.Type == MsgVoteResp || m.Type == MsgPreVoteResp {
 		sendCh = t.sendRespCh[m.To]
 	}
 	LogPrint(m.LogTopic(), "s%d sent %v to s%d at term %d %v", m.From, m.Type, m.To, m.Term, &m)

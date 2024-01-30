@@ -110,7 +110,7 @@ type Raft struct {
 	shutdown       chan struct{}     // shutdown the server, Set by Kill()
 
 	// volatile state on candidates
-	voteCount int // Number of votes received
+	votes map[int]bool // votes received from peers
 }
 
 // return currentTerm and whether this server
@@ -225,9 +225,49 @@ func (rf *Raft) requestVoteReturn(reply Message) {
 		return
 	}
 	if reply.Success && rf.storage.CurrentTerm() == reply.Term && rf.state == StateCandidate {
-		rf.voteCount++
-		if rf.voteCount > len(rf.peers)/2 {
+		rf.votes[reply.From] = true
+		if len(rf.votes) > len(rf.peers)/2 {
 			rf.becomeLeader()
+		}
+	}
+}
+
+func (rf *Raft) handlePreVote(args Message) {
+	// Reply false if term < currentTerm
+	// If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote
+
+	LogPrint(args.LogTopic(), "s%d received %v from s%d at term %d %v", rf.me, args.Type, args.From, rf.storage.CurrentTerm(), &args)
+	if args.Term < rf.storage.CurrentTerm() {
+		rf.send(args.From, Message{Type: MsgPreVoteResp, Success: false})
+		return
+	}
+	if args.LogTerm < rf.storage.LogTerm(rf.storage.LastLogIndex()) ||
+		args.LogTerm == rf.storage.LogTerm(rf.storage.LastLogIndex()) && args.LogIndex < rf.storage.LastLogIndex() {
+		rf.transport.Send(Message{Type: MsgPreVoteResp, From: rf.me, To: args.From, Term: args.Term, Success: false})
+		return
+	}
+	rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
+	rf.transport.Send(Message{Type: MsgPreVoteResp, From: rf.me, To: args.From, Term: args.Term, Success: true})
+}
+
+func (rf *Raft) preVoteReturn(reply Message) {
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+	// If votes received from majority of servers: become leader
+
+	LogPrint(reply.LogTopic(), "s%d received %v from s%d at term %d %v", rf.me, reply.Type, reply.From, rf.storage.CurrentTerm(), &reply)
+	if reply.Term > rf.storage.CurrentTerm() {
+		rf.storage.SetCurrentTerm(reply.Term)
+		rf.storage.SetVotedFor(VotedForNone)
+		rf.saveTerm()
+		if rf.state != StateFollower {
+			rf.becomeFollower()
+		}
+		return
+	}
+	if reply.Success && reply.Term == rf.storage.CurrentTerm() && rf.state == StateCandidate {
+		rf.votes[reply.From] = true
+		if len(rf.votes) > len(rf.peers)/2 {
+			rf.startElection()
 		}
 	}
 }
@@ -685,6 +725,10 @@ func (rf *Raft) runner() {
 			rf.handleInstallSnapshot(msg)
 		case MsgSnapResp:
 			rf.installSnapshotReturn(msg)
+		case MsgPreVoteReq:
+			rf.handlePreVote(msg)
+		case MsgPreVoteResp:
+			rf.preVoteReturn(msg)
 		case MsgStartCmd:
 			rf.startCommand(msg, status)
 		case MsgStartSnap:
@@ -835,7 +879,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.resetTimer(rf.electionTimer, rf.randomizedElectionTimeout())
 	rf.state = StateCandidate
 	rf.leader = LeaderNone
-	rf.startElection()
+	rf.startPreElection()
 }
 
 func (rf *Raft) becomeLeader() {
@@ -855,11 +899,30 @@ func (rf *Raft) becomeLeader() {
 	}
 }
 
+func (rf *Raft) startPreElection() {
+	for k := range rf.votes {
+		delete(rf.votes, k)
+	}
+	rf.votes[rf.me] = true
+	for i := range rf.peers {
+		if i != rf.me {
+			rf.send(i, Message{
+				Type:     MsgPreVoteReq,
+				LogIndex: rf.storage.LastLogIndex(),
+				LogTerm:  rf.storage.LogTerm(rf.storage.LastLogIndex()),
+			})
+		}
+	}
+}
+
 func (rf *Raft) startElection() {
 	rf.storage.SetCurrentTerm(rf.storage.CurrentTerm() + 1)
 	rf.storage.SetVotedFor(rf.me)
 	rf.saveTerm()
-	rf.voteCount = 1
+	for k := range rf.votes {
+		delete(rf.votes, k)
+	}
+	rf.votes[rf.me] = true
 	for i := range rf.peers {
 		if i != rf.me {
 			rf.send(i, Message{
@@ -892,6 +955,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.inflight = make([]int, len(rf.peers))
 	rf.retrying = make([]bool, len(rf.peers))
+	rf.votes = make(map[int]bool)
 	rf.maxInflight = 100
 
 	rf.leader = LeaderNone

@@ -11,6 +11,8 @@ const (
 	MsgAppResp
 	MsgSnapReq
 	MsgSnapResp
+	MsgPreVoteReq
+	MsgPreVoteResp
 	MsgStartCmd
 	MsgStartSnap
 	MsgGetState
@@ -65,9 +67,9 @@ const (
 
 func (msg *Message) String() string {
 	switch msg.Type {
-	case MsgVoteReq:
+	case MsgVoteReq, MsgPreVoteReq:
 		return fmt.Sprintf("<term: %d>", msg.Term)
-	case MsgVoteResp:
+	case MsgVoteResp, MsgPreVoteResp:
 		return fmt.Sprintf("<voted: %t, term: %d>", msg.Success, msg.Term)
 	case MsgAppReq:
 		switch len(msg.Entries) {
@@ -111,21 +113,25 @@ func (msg *Message) fillEntriesTerm(term int) {
 }
 
 var MessageTypeString = map[MessageType]string{
-	MsgVoteReq:  "MsgVoteReq",
-	MsgVoteResp: "MsgVoteResp",
-	MsgAppReq:   "MsgAppReq",
-	MsgAppResp:  "MsgAppResp",
-	MsgSnapReq:  "MsgSnapReq",
-	MsgSnapResp: "MsgSnapResp",
+	MsgVoteReq:     "MsgVoteReq",
+	MsgVoteResp:    "MsgVoteResp",
+	MsgAppReq:      "MsgAppReq",
+	MsgAppResp:     "MsgAppResp",
+	MsgSnapReq:     "MsgSnapReq",
+	MsgSnapResp:    "MsgSnapResp",
+	MsgPreVoteReq:  "MsgPreVoteReq",
+	MsgPreVoteResp: "MsgPreVoteResp",
 }
 
 var MessageLogTopic = map[MessageType]logTopic{
-	MsgVoteReq:  dVote,
-	MsgVoteResp: dVote,
-	MsgAppReq:   dLog,
-	MsgAppResp:  dLog2,
-	MsgSnapReq:  dSnap,
-	MsgSnapResp: dSnap,
+	MsgVoteReq:     dVote,
+	MsgVoteResp:    dVote,
+	MsgAppReq:      dLog,
+	MsgAppResp:     dLog2,
+	MsgSnapReq:     dSnap,
+	MsgSnapResp:    dSnap,
+	MsgPreVoteReq:  dVote,
+	MsgPreVoteResp: dVote,
 }
 
 // // example RequestVote RPC arguments structure.
