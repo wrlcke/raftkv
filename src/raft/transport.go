@@ -64,7 +64,12 @@ func (t *LabRpcTransport) Send(m Message) {
 	if m.Type == MsgAppResp || m.Type == MsgSnapResp || m.Type == MsgVoteResp || m.Type == MsgPreVoteResp {
 		sendCh = t.sendRespCh[m.To]
 	}
-	LogPrint(m.LogTopic(), "s%d sent %v to s%d at term %d %v", m.From, m.Type, m.To, m.Term, &m)
+	// For MsgPreVoteResp, m.Term is not the term of node itself, but the term of the MsgPreVoteReq
+	if m.Type != MsgPreVoteResp {
+		LogPrint(m.LogTopic(), "s%d sent %v to s%d at term %d %v", m.From, m.Type, m.To, m.Term, &m)
+	} else {
+		LogPrint(m.LogTopic(), "s%d sent %v to s%d %v", m.From, m.Type, m.To, &m)
+	}
 	select {
 	case sendCh <- m:
 	case <-t.shutdown:

@@ -56,6 +56,7 @@ const (
 	StateFollower RaftState = iota
 	StateCandidate
 	StateLeader
+	StatePreCandidate
 	NumStates
 )
 
@@ -271,10 +272,10 @@ func (rf *Raft) preVoteReturn(reply Message) {
 		}
 		return
 	}
-	if reply.Success && reply.Term == rf.storage.CurrentTerm() && rf.state == StateCandidate {
+	if reply.Success && reply.Term == rf.storage.CurrentTerm() && rf.state == StatePreCandidate {
 		rf.votes[reply.From] = true
 		if len(rf.votes) > len(rf.peers)/2 {
-			rf.startElection()
+			rf.becomeCandidate()
 		}
 	}
 }
@@ -521,7 +522,7 @@ batching_loop:
 }
 
 func (rf *Raft) startSnapshot(msg Message, status chan Status) {
-	LogPrint(dLeader, "s%d start snapshot at term %d %v", rf.me, rf.storage.CurrentTerm(), &msg)
+	LogPrint(dSnap, "s%d start snapshot at term %d %v", rf.me, rf.storage.CurrentTerm(), &msg)
 	if msg.LogIndex >= rf.storage.FirstLogIndex() {
 		rf.storage.RemoveLogPrefix(msg.LogIndex)
 		rf.storage.SetSnapshot(msg.Snapshot)
@@ -545,7 +546,7 @@ func (rf *Raft) sendStatus(status chan Status) {
 func (rf *Raft) onElectionTimeout() {
 	if rf.state != StateLeader {
 		LogPrint(dTimer, "s%d election timeout", rf.me)
-		rf.becomeCandidate()
+		rf.becomePreCandidate()
 	}
 }
 
@@ -842,6 +843,7 @@ func (rf *Raft) persister() {
 
 func (rf *Raft) applier(applyCh chan ApplyMsg) {
 	var msg ApplyMessage
+	var msgs []ApplyMsg
 	defer close(applyCh)
 	for {
 		select {
@@ -849,45 +851,52 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 			return
 		case msg = <-rf.applyCh:
 		}
-		if msg.applyType == ApplyCommand {
-			if len(msg.Entries) == 1 {
-				LogPrint(dCommit, "s%d apply log at term %d <entries: [%d]>", rf.me, msg.Term, msg.LogIndex+1)
-			} else {
-				LogPrint(dCommit, "s%d apply log at term %d <entries: [%d-%d]>", rf.me, msg.Term, msg.LogIndex+1, msg.LogIndex+len(msg.Entries))
-			}
+		switch msg.applyType {
+		case ApplyCommand:
+			LogPrint(dCommit, "s%d apply command at term %d %v", rf.me, msg.Term, &msg)
 			for i := range msg.Entries {
-				select {
-				case applyCh <- ApplyMsg{
+				msgs = append(msgs, ApplyMsg{
 					CommandValid: true,
 					Command:      msg.Entries[i].Command,
 					CommandIndex: msg.LogIndex + i + 1,
 					CommandTerm:  msg.Entries[i].Term,
-				}:
-				case <-rf.shutdown:
-					return
-				}
+				})
 			}
-		} else if msg.applyType == ApplySnapshot {
-			LogPrint(dCommit, "s%d apply snapshot at term %d <lastincluded: %d(term: %d)>", rf.me, msg.Term, msg.LogIndex, msg.LogTerm)
-			select {
-			case applyCh <- ApplyMsg{
+		case ApplySnapshot:
+			LogPrint(dCommit, "s%d apply snapshot at term %d %v", rf.me, msg.Term, &msg)
+			msgs = append(msgs, ApplyMsg{
 				SnapshotValid: true,
 				Snapshot:      msg.Snapshot,
 				SnapshotIndex: msg.LogIndex,
 				SnapshotTerm:  msg.LogTerm,
-			}:
+			})
+		default:
+			panic("unexpected apply type")
+		}
+		for i := range msgs {
+			select {
+			case applyCh <- msgs[i]:
 			case <-rf.shutdown:
 				return
 			}
 		}
+		msgs = msgs[:0]
 	}
 }
 
 func (rf *Raft) becomeFollower() {
-	LogPrint(dInfo, "s%d become follower at term %d", rf.me, rf.storage.CurrentTerm())
+	LogPrint(dInfo, "s%d became follower at term %d", rf.me, rf.storage.CurrentTerm())
 	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 	rf.state = StateFollower
 	rf.leader = LeaderNone
+}
+
+func (rf *Raft) becomePreCandidate() {
+	LogPrint(dInfo, "s%d became precandidate at term %d", rf.me, rf.storage.CurrentTerm())
+	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
+	rf.state = StatePreCandidate
+	rf.leader = LeaderNone
+	rf.startPreElection()
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -895,7 +904,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.electionTimer.Reset(rf.randomizedElectionTimeout())
 	rf.state = StateCandidate
 	rf.leader = LeaderNone
-	rf.startPreElection()
+	rf.startElection()
 }
 
 func (rf *Raft) becomeLeader() {
@@ -916,10 +925,7 @@ func (rf *Raft) becomeLeader() {
 }
 
 func (rf *Raft) startPreElection() {
-	for k := range rf.votes {
-		delete(rf.votes, k)
-	}
-	rf.votes[rf.me] = true
+	rf.votes = map[int]bool{rf.me: true}
 	for i := range rf.peers {
 		if i != rf.me {
 			rf.send(i, Message{
@@ -935,10 +941,7 @@ func (rf *Raft) startElection() {
 	rf.storage.SetCurrentTerm(rf.storage.CurrentTerm() + 1)
 	rf.storage.SetVotedFor(rf.me)
 	rf.saveTerm()
-	for k := range rf.votes {
-		delete(rf.votes, k)
-	}
-	rf.votes[rf.me] = true
+	rf.votes = map[int]bool{rf.me: true}
 	for i := range rf.peers {
 		if i != rf.me {
 			rf.send(i, Message{

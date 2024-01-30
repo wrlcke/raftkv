@@ -174,6 +174,12 @@ func (lps *LabPersisterStableStorage) ResetLog(lastIndex int, lastTerm int) {
 	lps.MemoryStorage.ResetLog(lastIndex, lastTerm)
 }
 
+func (lps *LabPersisterStableStorage) SetSnapshot(snapshot Snapshot) {
+	lps.rw.Lock()
+	defer lps.rw.Unlock()
+	lps.MemoryStorage.SetSnapshot(snapshot)
+}
+
 func (lps *LabPersisterStableStorage) Sync() {
 	lps.persist()
 }

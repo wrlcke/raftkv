@@ -68,7 +68,7 @@ const (
 func (msg *Message) String() string {
 	switch msg.Type {
 	case MsgVoteReq, MsgPreVoteReq:
-		return fmt.Sprintf("<term: %d>", msg.Term)
+		return fmt.Sprintf("<term: %d, latest: %d(term %d)>", msg.Term, msg.LogIndex, msg.LogTerm)
 	case MsgVoteResp, MsgPreVoteResp:
 		return fmt.Sprintf("<voted: %t, term: %d>", msg.Success, msg.Term)
 	case MsgAppReq:
@@ -93,6 +93,15 @@ func (msg *Message) String() string {
 		return fmt.Sprintf("<term: %d, lastinclude: %d(term: %d)>", msg.Term, msg.LogIndex, msg.LogTerm)
 	case MsgStartSnap:
 		return fmt.Sprintf("<lastinclude: %d>", msg.LogIndex)
+	case MsgApply:
+		switch len(msg.Entries) {
+		case 1:
+			return fmt.Sprintf("<entries: [%d]>", msg.LogIndex+1)
+		case 0:
+			return fmt.Sprintf("<lastinclude: %d(term: %d)>", msg.LogIndex, msg.LogTerm)
+		default:
+			return fmt.Sprintf("<entries: [%d-%d]>", msg.LogIndex+1, msg.LogIndex+len(msg.Entries))
+		}
 	default:
 		return ""
 	}
