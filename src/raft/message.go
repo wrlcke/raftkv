@@ -64,7 +64,7 @@ const (
 	ApplyCommand ApplyType = iota
 	ApplySnapshot
 	NotifyLeader
-	NotifyAbort
+	NotifyCommandAbort
 )
 
 func (msg *Message) String() string {

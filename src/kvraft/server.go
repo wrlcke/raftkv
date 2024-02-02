@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,7 @@ type KVServer struct {
 	shutdown chan struct{} // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persiter     *raft.Persister
 
 	// Your definitions here.
 	store KVStore
@@ -118,7 +120,9 @@ func (kv *KVServer) applier() {
 		switch {
 		case applyMsg.CommandValid:
 			kv.applyCommand(applyMsg.Command)
+			kv.triggerSnapshot(applyMsg.CommandIndex)
 		case applyMsg.SnapshotValid:
+			kv.applySnapshot(applyMsg.Snapshot)
 		case applyMsg.LeaderChange:
 			if applyMsg.Leader == kv.me {
 				LogPrint(dLeader, "s%d started a noop", kv.me)
@@ -157,6 +161,54 @@ func (kv *KVServer) applyCommand(command interface{}) {
 	kv.reg.MarkApplied(op.ClientId, op.RequestId, res)
 	kv.reg.MarkCompleted(op.ClientId, op.MaxCompleted)
 	kv.watch.Notify(op.ClientId, op.RequestId, res)
+}
+
+func (kv *KVServer) triggerSnapshot(index int) {
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if index%10 > 0 || kv.persiter.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	var b []byte
+	var err error
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if b, err = kv.store.Save(); err != nil {
+		panic(err)
+	}
+	if err := e.Encode(b); err != nil {
+		panic(err)
+	}
+	if b, err = kv.reg.Save(); err != nil {
+		panic(err)
+	}
+	if err := e.Encode(b); err != nil {
+		panic(err)
+	}
+	data := w.Bytes()
+	kv.rf.Snapshot(index, data)
+}
+
+func (kv *KVServer) applySnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var data []byte
+	if err := d.Decode(&data); err != nil {
+		panic(err)
+	}
+	if err := kv.store.Load(data); err != nil {
+		panic(err)
+	}
+	if err := d.Decode(&data); err != nil {
+		panic(err)
+	}
+	if err := kv.reg.Load(data); err != nil {
+		panic(err)
+	}
 }
 
 func (kv *KVServer) abortCommand(command interface{}) {
@@ -211,6 +263,34 @@ func (or *OperationRegistry) MarkCompleted(clientId, requestId int64) {
 			}
 		}
 	}
+}
+
+func (or *OperationRegistry) Save() ([]byte, error) {
+	or.mu.Lock()
+	defer or.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(or.res)
+	if err != nil {
+		return nil, err
+	}
+	err = e.Encode(or.completed)
+	if err != nil {
+		return nil, err
+	}
+	return w.Bytes(), nil
+}
+
+func (or *OperationRegistry) Load(data []byte) error {
+	or.mu.Lock()
+	defer or.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	err := d.Decode(&or.res)
+	if err != nil {
+		return err
+	}
+	return d.Decode(&or.completed)
 }
 
 func (ow *OperationWatch) Watch(clientId, requestId int64) <-chan OperationResult {
@@ -302,6 +382,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persiter = persister
 	kv.shutdown = make(chan struct{})
 
 	// You may need initialization code here.

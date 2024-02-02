@@ -326,7 +326,7 @@ func (rf *Raft) handleAppendEntries(args Message) {
 			matchIndex = args.LogIndex + i
 			appended = args.Entries[i:]
 			if args.LogIndex+1+i <= rf.storage.LastLogIndex() {
-				rf.apply(NotifyAbort, Message{Type: MsgApply, LogIndex: args.LogIndex + i,
+				rf.apply(NotifyCommandAbort, Message{Type: MsgApply, LogIndex: args.LogIndex + i,
 					Entries: rf.storage.LogEntries(args.LogIndex+1+i, rf.storage.LastLogIndex()+1)})
 				rf.storage.RemoveLogSuffix(args.LogIndex + 1 + i)
 			}
@@ -883,7 +883,7 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 				LeaderChange: true,
 				Leader:       msg.From,
 			})
-		case NotifyAbort:
+		case NotifyCommandAbort:
 			LogPrint(dCommit, "s%d abort log at term %d %v", rf.me, msg.Term, &msg)
 			for i := range msg.Entries {
 				msgs = append(msgs, ApplyMsg{
@@ -1014,6 +1014,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.transport = NewLabRpcTransport(peers, me, rf.recvCh)
 	rf.commitIndex = rf.storage.FirstLogIndex() - 1
 	rf.lastApplied = rf.storage.FirstLogIndex() - 1
+	if rf.storage.Snapshot() != nil && len(rf.storage.Snapshot()) > 0 {
+		rf.apply(ApplySnapshot, Message{Type: MsgApply, LogIndex: rf.lastApplied, LogTerm: rf.storage.LogTerm(rf.lastApplied), Snapshot: rf.storage.Snapshot()})
+	}
 
 	// start ticker goroutine to start elections
 	// go rf.ticker()

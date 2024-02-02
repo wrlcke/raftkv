@@ -1,9 +1,17 @@
 package kvraft
 
+import (
+	"bytes"
+
+	"6.5840/labgob"
+)
+
 type KVStore interface {
 	Put(key string, value string)
 	Append(key string, value string)
 	Get(key string) string
+	Save() ([]byte, error)
+	Load(data []byte) error
 }
 
 type MapKVStore struct {
@@ -28,4 +36,20 @@ func (kv *MapKVStore) Get(key string) string {
 		return value
 	}
 	return ""
+}
+
+func (kv *MapKVStore) Save() ([]byte, error) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(kv.data)
+	if err != nil {
+		return nil, err
+	}
+	return w.Bytes(), err
+}
+
+func (kv *MapKVStore) Load(data []byte) error {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	return d.Decode(&kv.data)
 }
