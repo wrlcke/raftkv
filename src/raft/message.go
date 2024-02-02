@@ -63,6 +63,8 @@ type ApplyType int
 const (
 	ApplyCommand ApplyType = iota
 	ApplySnapshot
+	NotifyLeader
+	NotifyAbort
 )
 
 func (msg *Message) String() string {

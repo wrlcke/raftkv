@@ -1,4 +1,4 @@
-package raft
+package kvraft
 
 import (
 	"fmt"
@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"6.5840/raft"
 )
 
 // Retrieve the verbosity level from an environment variable
@@ -49,13 +51,9 @@ var debugVerbosity int
 
 func init() {
 	debugVerbosity = getVerbosity()
-	debugStart = time.Now()
+	debugStart = raft.DebugStartTime()
 
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
-}
-
-func DebugStartTime() time.Time {
-	return debugStart
 }
 
 func LogPrint(topic logTopic, format string, a ...interface{}) {

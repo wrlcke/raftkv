@@ -43,7 +43,7 @@ func random_handles(kvh []*labrpc.ClientEnd) []*labrpc.ClientEnd {
 
 type config struct {
 	mu           sync.Mutex
-	t            *testing.T
+	t            testing.TB
 	net          *labrpc.Network
 	n            int
 	kvservers    []*KVServer
@@ -357,7 +357,7 @@ func (cfg *config) make_partition() ([]int, []int) {
 
 var ncpu_once sync.Once
 
-func make_config(t *testing.T, n int, unreliable bool, maxraftstate int) *config {
+func make_config(t testing.TB, n int, unreliable bool, maxraftstate int) *config {
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {
 			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")

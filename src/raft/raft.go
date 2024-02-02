@@ -39,6 +39,7 @@ import (
 // other uses.
 type ApplyMsg struct {
 	CommandValid bool
+	CommandAbort bool
 	Command      interface{}
 	CommandIndex int
 	CommandTerm  int
@@ -48,6 +49,9 @@ type ApplyMsg struct {
 	Snapshot      []byte
 	SnapshotTerm  int
 	SnapshotIndex int
+
+	LeaderChange bool
+	Leader       int
 }
 
 type RaftState int
@@ -321,7 +325,11 @@ func (rf *Raft) handleAppendEntries(args Message) {
 				args.Entries[i].Term != rf.storage.LogTerm(args.LogIndex+1+i) {
 			matchIndex = args.LogIndex + i
 			appended = args.Entries[i:]
-			rf.storage.RemoveLogSuffix(args.LogIndex + 1 + i)
+			if args.LogIndex+1+i <= rf.storage.LastLogIndex() {
+				rf.apply(NotifyAbort, Message{Type: MsgApply, LogIndex: args.LogIndex + i,
+					Entries: rf.storage.LogEntries(args.LogIndex+1+i, rf.storage.LastLogIndex()+1)})
+				rf.storage.RemoveLogSuffix(args.LogIndex + 1 + i)
+			}
 			rf.storage.AppendLog(args.Entries[i:]...)
 			break
 		}
@@ -870,6 +878,21 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 				SnapshotIndex: msg.LogIndex,
 				SnapshotTerm:  msg.LogTerm,
 			})
+		case NotifyLeader:
+			msgs = append(msgs, ApplyMsg{
+				LeaderChange: true,
+				Leader:       msg.From,
+			})
+		case NotifyAbort:
+			LogPrint(dCommit, "s%d abort log at term %d %v", rf.me, msg.Term, &msg)
+			for i := range msg.Entries {
+				msgs = append(msgs, ApplyMsg{
+					CommandAbort: true,
+					Command:      msg.Entries[i].Command,
+					CommandIndex: msg.LogIndex + i + 1,
+					CommandTerm:  msg.Entries[i].Term,
+				})
+			}
 		default:
 			panic("unexpected apply type")
 		}
@@ -922,6 +945,7 @@ func (rf *Raft) becomeLeader() {
 		rf.inflight[i] = 0
 		rf.retrying[i] = false
 	}
+	rf.apply(NotifyLeader, Message{Type: MsgApply, From: rf.me})
 }
 
 func (rf *Raft) startPreElection() {
