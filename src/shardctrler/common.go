@@ -28,8 +28,20 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func DefaultConfig() Config {
+	return Config{
+		Num:    0,
+		Shards: [NShards]int{},
+		Groups: map[int][]string{},
+	}
+}
+
 const (
-	OK = "OK"
+	OK                 = "OK"
+	ErrWrongLeader     = "ErrWrongLeader"
+	ErrAborted         = "ErrAborted"
+	ErrCanceledByRetry = "ErrCanceledByRetry"
+	ErrShutdown        = "ErrShutdown"
 )
 
 type Err string
@@ -38,36 +50,26 @@ type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
 }
 
-type JoinReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
 type LeaveArgs struct {
 	GIDs []int
-}
-
-type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
 }
 
 type MoveArgs struct {
 	Shard int
 	GID   int
 }
-
-type MoveReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
 type QueryArgs struct {
 	Num int // desired config number
 }
 
-type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+type Operation struct {
+	Args         interface{}
+	ClientId     int64
+	RequestId    int64
+	MaxCompleted int64
+}
+
+type OperationResult struct {
+	Err    Err
+	Config Config
 }

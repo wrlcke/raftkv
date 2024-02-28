@@ -2,12 +2,29 @@ package shardctrler
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/goleak"
 )
 
 // import "time"
+
+func getLeakCheck() bool {
+	v := os.Getenv("LEAK_CHECK")
+	return v != ""
+}
+
+func TestMain(m *testing.M) {
+	if getLeakCheck() {
+		goleak.VerifyTestMain(m)
+	} else {
+		ec := m.Run()
+		os.Exit(ec)
+	}
+}
 
 func check(t *testing.T, groups []int, ck *Clerk) {
 	c := ck.Query(-1)
